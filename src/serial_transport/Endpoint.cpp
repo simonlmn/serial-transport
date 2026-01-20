@@ -45,6 +45,7 @@ void Endpoint::setup(unsigned long baud) {
 
 void Endpoint::reset() {
     _rxBufferSize = 0u;
+    _bufferOverflow = false;
     _lastTxQueueIndex = 0u;
     _currentTxSequenceNumber = MAX_SEQUENCE_NUMBER;
     _currentRxSequenceNumber = 0u;
@@ -205,20 +206,22 @@ void Endpoint::receive() {
 
     char* newLine = reinterpret_cast<char*>(memchr(_rxBuffer, '\n', newRxBufferSize));
     if (newLine != nullptr) {
-        if ((newLine != _rxBuffer) && *(newLine - 1) == '\r') {
-            *(newLine - 1) = '\0';
-
-            handleRxMessage(_rxBuffer);
-            
-            _rxBufferSize = (_rxBuffer + newRxBufferSize) - (newLine + 1);
-            memmove(_rxBuffer, newLine + 1, _rxBufferSize);
-        } else {
-            sendError(ErrorCode::InvalidMessageTermination);
-            _rxBufferSize = 0u;
+        if (!_bufferOverflow) {
+            if ((newLine != _rxBuffer) && *(newLine - 1) == '\r') {
+                *(newLine - 1) = '\0';
+                handleRxMessage(_rxBuffer);
+            } else {
+                sendError(ErrorCode::InvalidMessageTermination);
+            }
         }
+        // Skip over to the data after the new line in either case
+        _rxBufferSize = (_rxBuffer + newRxBufferSize) - (newLine + 1);
+        memmove(_rxBuffer, newLine + 1, _rxBufferSize);
+        _bufferOverflow = false;
     } else if (newRxBufferSize >= BUFFER_MAX_SIZE) {
         sendError(ErrorCode::InvalidMessageTermination);
         _rxBufferSize = 0u;
+        _bufferOverflow = true;
     } else {
         _rxBufferSize = newRxBufferSize;
     }

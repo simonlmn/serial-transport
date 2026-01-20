@@ -84,6 +84,7 @@ private:
 
     char _rxBuffer[BUFFER_MAX_SIZE] = {};
     size_t _rxBufferSize = 0u;
+    bool _bufferOverflow = false;
 
     static const uint8_t MAX_SEQUENCE_NUMBER = 25u;
 
