@@ -13,7 +13,7 @@ namespace serial_transport {
 static const char BEGIN_CONTROL_MESSAGE = '#';
 static const char BEGIN_CONTROL_RESPONSE_MESSAGE = '>';
 static const char BEGIN_NORMAL_MESSAGE = '+';
-static const char TERMINATOR[] = "\r\n";
+static const char TERMINATOR = '\n';
 
 static const char CONTROL_ACKNOWLEDGE = '=';
 static const char CONTROL_ERROR = '!';
@@ -22,7 +22,7 @@ static const char CONTROL_DEBUG = 'D';
 
 const char* describe(ErrorCode errorCode) {
     switch (errorCode) {
-        case ErrorCode::InvalidMessageTermination: return "Invalid or no message termination";
+        case ErrorCode::RxBufferOverflow: return "Receive buffer overflow";
         case ErrorCode::InvalidMessageStart: return "Invalid message start indicator";
         case ErrorCode::InvalidMessageSize: return "Invalid message size";
         case ErrorCode::InvalidControlMessage: return "Unknown control message";
@@ -38,8 +38,8 @@ Endpoint::Endpoint(ReceiveCallback processReceived, ErrorCallback handleError) :
     _handleError(handleError)
 {}
 
-void Endpoint::setup(unsigned long baud) {
-    Serial.begin(baud);
+void Endpoint::setup(unsigned long baud, SerialConfig serialMode) {
+    Serial.begin(baud, serialMode);
     Serial.setTimeout(2);
 }
 
@@ -92,16 +92,23 @@ bool Endpoint::queue(const char* fmt, ...) {
         return false;
     }
 
+    char payload[PAYLOAD_MAX_SIZE] = {};
+
+    va_list args;
+    va_start(args, fmt);
+    int payloadSize = vsnprintf(payload, PAYLOAD_MAX_SIZE, fmt, args);
+    va_end(args);
+    if (payloadSize < 0 || payloadSize >= static_cast<int>(PAYLOAD_MAX_SIZE)) {
+        return false;
+    }
+
     QueuedMessage& message = _txQueue[incrementLastTxQueueIndex()];
     message.sequenceNumber = incrementTxSequenceNumber();
     message.acknowledged = false;
     message.sendTime = 0u;
     message.retries = _resendLimit;
-
-    va_list args;
-    va_start(args, fmt);
-    message.payloadSize = vsnprintf(message.payload, PAYLOAD_MAX_SIZE, fmt, args);
-    va_end(args);
+    message.payloadSize = static_cast<size_t>(payloadSize);
+    memcpy(message.payload, payload, message.payloadSize);
 
     if (canSend(_lastTxQueueIndex)) {
         send(message);
@@ -125,13 +132,15 @@ void Endpoint::sendAcknowledge(uint8_t sequenceNumber) {
     Serial.write(BEGIN_CONTROL_MESSAGE);
     Serial.write(CONTROL_ACKNOWLEDGE);
     Serial.write('A' + sequenceNumber);
+    Serial.write(' ');
     Serial.write(TERMINATOR);
 }
 
-void Endpoint::sendError(ErrorCode errorCode) {
+void Endpoint::sendError(ErrorCode errorCode, char detail) {
     Serial.write(BEGIN_CONTROL_MESSAGE);
     Serial.write(CONTROL_ERROR);
     Serial.write(static_cast<char>(errorCode));
+    Serial.write(detail);
     Serial.write(TERMINATOR);
 }
 
@@ -142,6 +151,10 @@ void Endpoint::sendControlResponse(const char forControl, const char* fmt, ...) 
     va_start(args, fmt);
     size_t payloadSize = vsnprintf(payload, PAYLOAD_MAX_SIZE, fmt, args);
     va_end(args);
+
+    if (payloadSize < 0 || payloadSize >= static_cast<int>(PAYLOAD_MAX_SIZE)) {
+        return;
+    }
 
     Serial.write(BEGIN_CONTROL_RESPONSE_MESSAGE);
     Serial.write(forControl);
@@ -201,25 +214,32 @@ uint8_t Endpoint::wrapSequenceNumber(uint8_t sequenceNumber) {
 }
 
 void Endpoint::receive() {
+    if (Serial.available() == 0) {
+        return;
+    }
+
     auto bytesRead = Serial.readBytes(_rxBuffer + _rxBufferSize, BUFFER_MAX_SIZE - _rxBufferSize);
     auto newRxBufferSize = _rxBufferSize + bytesRead;
 
-    char* newLine = reinterpret_cast<char*>(memchr(_rxBuffer, '\n', newRxBufferSize));
-    if (newLine != nullptr) {
+    char* terminator = reinterpret_cast<char*>(memchr(_rxBuffer, TERMINATOR, newRxBufferSize));
+    if (terminator != nullptr) {
         if (!_bufferOverflow) {
-            if ((newLine != _rxBuffer) && *(newLine - 1) == '\r') {
-                *(newLine - 1) = '\0';
-                handleRxMessage(_rxBuffer);
-            } else {
-                sendError(ErrorCode::InvalidMessageTermination);
+            char* messageStart = _rxBuffer;
+            while (messageStart != terminator && *messageStart == ' ') { // skip leading spaces
+                ++messageStart;
+            }
+
+            if (messageStart != terminator) { // non-empty message
+                *terminator = '\0';
+                handleRxMessage(messageStart);
             }
         }
-        // Skip over to the data after the new line in either case
-        _rxBufferSize = (_rxBuffer + newRxBufferSize) - (newLine + 1);
-        memmove(_rxBuffer, newLine + 1, _rxBufferSize);
+        // Shift remaining data to the front of the buffer
+        _rxBufferSize = (_rxBuffer + newRxBufferSize) - (terminator + 1);
+        memmove(_rxBuffer, terminator + 1, _rxBufferSize);
         _bufferOverflow = false;
     } else if (newRxBufferSize >= BUFFER_MAX_SIZE) {
-        sendError(ErrorCode::InvalidMessageTermination);
+        sendError(ErrorCode::RxBufferOverflow);
         _rxBufferSize = 0u;
         _bufferOverflow = true;
     } else {
@@ -240,49 +260,63 @@ void Endpoint::handleRxMessage(const char* rxMessage) {
             // we don't handle it, as it is used for interactive testing/debugging only for now.
             break;
         default:
-            sendError(ErrorCode::InvalidMessageStart);
+            sendError(ErrorCode::InvalidMessageStart, rxMessage[0]);
             break;
     }
 }
 
 void Endpoint::handleNormalMessage(const char* rxMessage, size_t rxMessageLength) {
-    if (rxMessageLength >= BEGIN_SIZE + SEQUENCE_COUNTER_SIZE) {
-        if (rxMessage[2] != ' ') {
-            sendError(ErrorCode::InvalidSequenceCounter);
-        }
-        uint8_t sequenceNumber = uint8_t(rxMessage[1] - 'A');
-        if (sequenceNumber == _currentRxSequenceNumber) {
-            sendAcknowledge(incrementRxSequenceNumber());
-            _processReceived(rxMessage + BEGIN_SIZE + SEQUENCE_COUNTER_SIZE, *this);
-        } else {
-            sendAcknowledge(_currentRxSequenceNumber); // Send last ack again to trigger a re-send
-        }
+    if (rxMessageLength <= BEGIN_SIZE + SEQUENCE_COUNTER_SIZE) {
+        return; // Ignore overly short/truncated normal messages to avoid spurious warnings
+    }
+
+    if (rxMessage[2] != ' ') {
+        sendError(ErrorCode::InvalidSequenceCounter, rxMessage[2]);
+        return;
+    }
+
+    uint8_t sequenceNumber = uint8_t(rxMessage[1] - 'A');
+    if (sequenceNumber == _currentRxSequenceNumber) {
+        sendAcknowledge(incrementRxSequenceNumber());
+        _processReceived(rxMessage + BEGIN_SIZE + SEQUENCE_COUNTER_SIZE, *this);
     } else {
-        sendError(ErrorCode::InvalidMessageSize);
+        sendAcknowledge(_currentRxSequenceNumber); // Send last ack again to trigger a re-send
     }
 }
 
 void Endpoint::handleControlMessage(const char* rxMessage, size_t rxMessageLength) {
-    if (rxMessageLength == CONTROL_MESSAGE_SIZE) {
-        switch (rxMessage[1]) {
-            case CONTROL_ACKNOWLEDGE:
+    switch (rxMessage[1]) {
+        case CONTROL_ACKNOWLEDGE:
+            if (rxMessageLength == CONTROL_MESSAGE_HEAD_SIZE + SEQUENCE_COUNTER_SIZE) {
                 handleAcknowledge(uint8_t(rxMessage[2] - 'A'));
-                break;
-            case CONTROL_ERROR:
-                _handleError(static_cast<ErrorCode>(rxMessage[2]), *this);
-                break;
-            case CONTROL_TIMEOUT:
+            } else {
+                sendError(ErrorCode::InvalidMessageSize, CONTROL_ACKNOWLEDGE);
+            }
+            break;
+        case CONTROL_ERROR:
+            if (rxMessageLength == CONTROL_MESSAGE_HEAD_SIZE + ERROR_SIZE) {
+                _handleError(static_cast<ErrorCode>(rxMessage[2]), rxMessage[3], *this);
+            } else {
+                sendError(ErrorCode::InvalidMessageSize, CONTROL_ERROR);
+            }
+            break;
+        case CONTROL_TIMEOUT:
+            if (rxMessageLength == CONTROL_MESSAGE_HEAD_SIZE + 1u) {
                 handleTimeoutControl(rxMessage[2]);
-                break;
-            case CONTROL_DEBUG:
+            } else {
+                sendError(ErrorCode::InvalidMessageSize, CONTROL_TIMEOUT);
+            }
+            break;
+        case CONTROL_DEBUG:
+            if (rxMessageLength == CONTROL_MESSAGE_HEAD_SIZE) {
                 sendControlResponse(CONTROL_DEBUG, "%u %u %u %u %u %u", _currentTxSequenceNumber, _currentRxSequenceNumber, _lastTxQueueIndex, _currentUnacknowledgedTxQueueIndex, _txQueue[_currentUnacknowledgedTxQueueIndex].acknowledged, _txQueue[_currentUnacknowledgedTxQueueIndex].sendTime);
-                break;
-            default:
-                sendError(ErrorCode::InvalidControlMessage);
-                break;
-        }
-    } else {
-        sendError(ErrorCode::InvalidMessageSize);
+            } else {
+                sendError(ErrorCode::InvalidMessageSize, CONTROL_DEBUG);
+            }
+            break;
+        default:
+            sendError(ErrorCode::InvalidControlMessage, rxMessage[1]);
+            break;
     }
 }
 
@@ -294,8 +328,6 @@ void Endpoint::handleAcknowledge(uint8_t sequenceNumber) {
         if (!nextMessage.acknowledged && canSend(_currentUnacknowledgedTxQueueIndex)) {
             send(nextMessage);
         }
-    } else {
-        // ignore
     }
 }
 

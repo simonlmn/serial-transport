@@ -8,7 +8,7 @@ namespace serial_transport {
 class Endpoint;
 
 enum struct ErrorCode : char {
-    InvalidMessageTermination = 'E',
+    RxBufferOverflow = 'O',
     InvalidMessageStart = 'H',
     InvalidMessageSize = 'S',
     InvalidControlMessage = 'C',
@@ -21,52 +21,63 @@ const char* describe(ErrorCode errorCode);
 
 #if defined(ARDUINO_AVR_NANO)
 using ReceiveCallback = void (*)(const char* rxMessage, Endpoint& serial);
-using ErrorCallback = void (*)(ErrorCode errorCode, Endpoint& serial);
+using ErrorCallback = void (*)(ErrorCode errorCode, char detail, Endpoint& serial);
 #else
 #include <functional>
 using ReceiveCallback = std::function<void(const char* rxMessage, Endpoint& serial)>;
-using ErrorCallback = std::function<void(ErrorCode errorCode, Endpoint& serial)>;
+using ErrorCallback = std::function<void(ErrorCode errorCode, char detail, Endpoint& serial)>;
+#endif
+
+#if defined(__AVR__)
+using SerialConfig = uint8_t;
 #endif
 
 /**
  * ASCII based protocol to communicate reliably over a serial connection without hardware flow control.
  * 
  * Control messages:
- * #=[A-Z]
- * #![A-Z]
- * #T-
- * #T+
- * #D 
+ * #=[A-Z] \n
+ * #![A-Z].\n
+ * #T-\n
+ * #T+\n
+ * #D\n
+ * 
+ * Control response messages:
+ * >T-\n
+ * >T+\n
+ * >D _______________________________________________________\n
  * 
  * Normal messages:
- * +[A-Z] _____________________________________________________
+ * +[A-Z] _____________________________________________________\n
  * 
  * CAN module specific messages:
- * +[A-Z] READY\r\n
- * +[A-Z] SETUP FFFFFFFF NOR|LOP|SLP|LIS\r\n
- * +[A-Z] SETUP OK 9 64 8 8 8 4 1 1234567890 1 1234567890\r\n
- * +[A-Z] SETUP EFFFF: FFFFFFFF NOR|LOP|SLP|LIS\r\n
- * +[A-Z] CANRX FFFFFFFF 8 01 02 03 04 05 06 07 08 \r\n
- * +[A-Z] CANTX FFFFFFFF 8 01 02 03 04 05 06 07 08 \r\n
- * +[A-Z] CANTX OK FFFFFFFF 8 01 02 03 04 05 06 07 08 \r\n
- * +[A-Z] CANTX ENVAL FFFFFFFF 8 01 02 03 04 05 06 07 08 \r\n
- * +[A-Z] CANTX ESEND FFFFFFFF 8 01 02 03 04 05 06 07 08 \r\n
- * +[A-Z] CANTX ENOAV FFFFFFFF 8 01 02 03 04 05 06 07 08 \r\n
- * +[A-Z] ERROR _______________________________________________\r\n
+ * +[A-Z] READY\n
+ * +[A-Z] SETUP FFFFFFFF NOR|LOP|SLP|LIS\n
+ * +[A-Z] SETUP OK 9 64 8 8 8 4 1 1234567890 1 1234567890\n
+ * +[A-Z] SETUP EFFFF: FFFFFFFF NOR|LOP|SLP|LIS\n
+ * +[A-Z] CANRX FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
+ * +[A-Z] CANTX FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
+ * +[A-Z] CANTX OK FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
+ * +[A-Z] CANTX ENVAL FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
+ * +[A-Z] CANTX ESEND FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
+ * +[A-Z] CANTX ENOAV FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
+ * +[A-Z] ERROR _______________________________________________\n
  */
 class Endpoint final {
 private:
     static const unsigned long DEFAULT_BAUD_RATE = 115200u;
+    static const SerialConfig DEFAULT_SERIAL_MODE = SERIAL_8E1;
 
     static const unsigned long DEFAULT_TIMEOUT = 2000u;
     static const uint8_t DEFAULT_RESEND_LIMIT = 4u;
 
     static const size_t BUFFER_MAX_SIZE = 64u;
     static const size_t BEGIN_SIZE = 1u;
-    static const size_t TERMINATOR_SIZE = 2u;
+    static const size_t TERMINATOR_SIZE = 1u;
     static const size_t SEQUENCE_COUNTER_SIZE = 2u;
-    static const size_t PAYLOAD_MAX_SIZE = BUFFER_MAX_SIZE - BEGIN_SIZE - TERMINATOR_SIZE - SEQUENCE_COUNTER_SIZE;
-    static const size_t CONTROL_MESSAGE_SIZE = BEGIN_SIZE + 2u;
+    static const size_t ERROR_SIZE = 2u;
+    static const size_t PAYLOAD_MAX_SIZE = BUFFER_MAX_SIZE - BEGIN_SIZE - SEQUENCE_COUNTER_SIZE - TERMINATOR_SIZE;
+    static const size_t CONTROL_MESSAGE_HEAD_SIZE = BEGIN_SIZE + 1u;
 
     struct QueuedMessage {
         char payload[PAYLOAD_MAX_SIZE] = {};
@@ -100,7 +111,7 @@ private:
 
     void send(QueuedMessage& message);
     void sendAcknowledge(uint8_t sequenceNumber);
-    void sendError(ErrorCode errorCode);
+    void sendError(ErrorCode errorCode, char detail = '-');
     void sendControlResponse(const char forControl, const char* fmt, ...);
     const QueuedMessage& currentUnacknowledgedMessage() const;
     QueuedMessage& currentUnacknowledgedMessage();
@@ -122,7 +133,7 @@ private:
 public:
     Endpoint(ReceiveCallback processReceived, ErrorCallback handleError);
 
-    void setup(unsigned long baud = DEFAULT_BAUD_RATE);
+    void setup(unsigned long baud = DEFAULT_BAUD_RATE, SerialConfig serialMode = DEFAULT_SERIAL_MODE);
     void reset();
     void loop();
     bool canQueue() const;
