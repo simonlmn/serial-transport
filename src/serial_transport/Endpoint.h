@@ -8,24 +8,19 @@ namespace serial_transport {
 class Endpoint;
 
 enum struct ErrorCode : char {
-    RxBufferOverflow = 'O',
-    InvalidMessageStart = 'H',
-    InvalidMessageSize = 'S',
-    InvalidControlMessage = 'C',
-    InvalidTimeoutControl = 'T',
-    InvalidSequenceCounter = 'Q',
-    ResendLimitExceeded = 'R'
+    ResendLimitExceeded = 'R',
+    BufferFull = 'O'
 };
 
 const char* describe(ErrorCode errorCode);
 
 #if defined(ARDUINO_AVR_NANO)
 using ReceiveCallback = void (*)(const char* rxMessage, Endpoint& serial);
-using ErrorCallback = void (*)(ErrorCode errorCode, char detail, Endpoint& serial);
+using ErrorCallback = void (*)(ErrorCode errorCode, Endpoint& serial);
 #else
 #include <functional>
 using ReceiveCallback = std::function<void(const char* rxMessage, Endpoint& serial)>;
-using ErrorCallback = std::function<void(ErrorCode errorCode, char detail, Endpoint& serial)>;
+using ErrorCallback = std::function<void(ErrorCode errorCode, Endpoint& serial)>;
 #endif
 
 #if defined(__AVR__)
@@ -33,35 +28,29 @@ using SerialConfig = uint8_t;
 #endif
 
 /**
- * ASCII based protocol to communicate reliably over a serial connection without hardware flow control.
+ * Binary framing protocol for reliable serial communication without hardware flow control.
  * 
- * Control messages:
- * #=[A-Z] \n
- * #![A-Z].\n
- * #T-\n
- * #T+\n
- * #D\n
+ * Frame format:
+ * [SYNC1:0x5A] [SYNC2:0xA5] [TYPE] [LENGTH] [SEQ] [PAYLOAD...] [CRC8]
  * 
- * Control response messages:
- * >T-\n
- * >T+\n
- * >D _______________________________________________________\n
+ * SYNC1/SYNC2: 2 bytes, frame start marker (0x5A 0xA5)
+ * TYPE: Frame type (0x01=DATA, 0x02=ACK, 0x03=TIMEOUT_CONTROL)
+ * LENGTH: Payload length (0-57 bytes max)
+ * SEQ: Sequence number (0-255)
+ * PAYLOAD: Up to 57 bytes of data
+ * CRC8: CCITT CRC (polynomial 0x07, initial 0x00)
  * 
- * Normal messages:
- * +[A-Z] _____________________________________________________\n
+ * Total frame size: 2 + 3 header + payload + 1 CRC = max 64 bytes
  * 
- * CAN module specific messages:
- * +[A-Z] READY\n
- * +[A-Z] SETUP FFFFFFFF NOR|LOP|SLP|LIS\n
- * +[A-Z] SETUP OK 9 64 8 8 8 4 1 1234567890 1 1234567890\n
- * +[A-Z] SETUP EFFFF: FFFFFFFF NOR|LOP|SLP|LIS\n
- * +[A-Z] CANRX FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
- * +[A-Z] CANTX FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
- * +[A-Z] CANTX OK FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
- * +[A-Z] CANTX ENVAL FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
- * +[A-Z] CANTX ESEND FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
- * +[A-Z] CANTX ENOAV FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
- * +[A-Z] ERROR _______________________________________________\n
+ * Payloads (unchanged from ASCII protocol):
+ * READY\n
+ * SETUP FFFFFFFF NOR|LOP|SLP|LIS\n
+ * SETUP OK 9 64 8 8 8 4 1 1234567890 1 1234567890\n
+ * SETUP EFFFF: FFFFFFFF NOR|LOP|SLP|LIS\n
+ * CANRX FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
+ * CANTX FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
+ * CANTX OK FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
+ * etc.
  */
 class Endpoint final {
 private:
@@ -71,13 +60,16 @@ private:
     static const unsigned long DEFAULT_TIMEOUT = 2000u;
     static const uint8_t DEFAULT_RESEND_LIMIT = 4u;
 
+    static const uint8_t SYNC1 = 0x5Au;
+    static const uint8_t SYNC2 = 0xA5u;
+    
+    static const uint8_t FRAME_TYPE_DATA = 0x01u;
+    static const uint8_t FRAME_TYPE_ACK = 0x02u;
+    static const uint8_t FRAME_TYPE_TIMEOUT_CONTROL = 0x03u;
+
     static const size_t BUFFER_MAX_SIZE = 64u;
-    static const size_t BEGIN_SIZE = 1u;
-    static const size_t TERMINATOR_SIZE = 1u;
-    static const size_t SEQUENCE_COUNTER_SIZE = 2u;
-    static const size_t ERROR_SIZE = 2u;
-    static const size_t PAYLOAD_MAX_SIZE = BUFFER_MAX_SIZE - BEGIN_SIZE - SEQUENCE_COUNTER_SIZE - TERMINATOR_SIZE;
-    static const size_t CONTROL_MESSAGE_HEAD_SIZE = BEGIN_SIZE + 1u;
+    static const size_t FRAME_OVERHEAD = 6u; // SYNC1 + SYNC2 + TYPE + LENGTH + SEQ + CRC8
+    static const size_t PAYLOAD_MAX_SIZE = BUFFER_MAX_SIZE - FRAME_OVERHEAD;
 
     struct QueuedMessage {
         char payload[PAYLOAD_MAX_SIZE] = {};
@@ -91,15 +83,12 @@ private:
     static const size_t TX_QUEUE_SIZE = 6u;
     QueuedMessage _txQueue[TX_QUEUE_SIZE] = {};
     size_t _lastTxQueueIndex = 0u;
-    size_t _currentUnacknowledgedTxQueueIndex = 0u; // can point to an acknowledged message, which means no messages are unacknowledged
+    size_t _currentUnacknowledgedTxQueueIndex = 0u;
 
-    char _rxBuffer[BUFFER_MAX_SIZE] = {};
+    uint8_t _rxBuffer[BUFFER_MAX_SIZE] = {};
     size_t _rxBufferSize = 0u;
-    bool _bufferOverflow = false;
 
-    static const uint8_t MAX_SEQUENCE_NUMBER = 25u;
-
-    uint8_t _currentTxSequenceNumber = MAX_SEQUENCE_NUMBER;
+    uint8_t _currentTxSequenceNumber = 0u;
     uint8_t _currentRxSequenceNumber = 0u;
 
     bool _timeoutEnabled = true;
@@ -109,10 +98,14 @@ private:
     ReceiveCallback _processReceived;
     ErrorCallback _handleError;
 
+    // CRC-8-CCITT lookup table (256 entries, 256 bytes)
+    static const uint8_t CRC8_TABLE[256] PROGMEM;
+
+    uint8_t calculateCrc8(const uint8_t* data, size_t length) const;
+    void sendFrame(uint8_t type, uint8_t seq, const uint8_t* payload, uint8_t payloadLen);
+    void handleFrame(uint8_t type, uint8_t seq, const uint8_t* payload, uint8_t payloadLen);
     void send(QueuedMessage& message);
     void sendAcknowledge(uint8_t sequenceNumber);
-    void sendError(ErrorCode errorCode, char detail = '-');
-    void sendControlResponse(const char forControl, const char* fmt, ...);
     const QueuedMessage& currentUnacknowledgedMessage() const;
     QueuedMessage& currentUnacknowledgedMessage();
     void acknowledgeCurrentUnacknowledgedMessage();
@@ -122,13 +115,9 @@ private:
     size_t incrementCurrentUnacknowledgedTxQueueIndex();
     uint8_t incrementTxSequenceNumber();
     uint8_t incrementRxSequenceNumber();
-    uint8_t wrapSequenceNumber(uint8_t sequenceNumber);
     void receive();
-    void handleNormalMessage(const char* rxMessage, size_t rxMessageLength);
-    void handleControlMessage(const char* rxMessage, size_t rxMessageLength);
-    void handleRxMessage(const char* rxMessage);
     void handleAcknowledge(uint8_t sequenceNumber);
-    void handleTimeoutControl(const char operation);
+    void handleTimeoutControl(uint8_t operation);
 
 public:
     Endpoint(ReceiveCallback processReceived, ErrorCallback handleError);
@@ -148,5 +137,7 @@ bool queueCanTxMessage(Endpoint& serial, uint32_t id, bool ext, bool rtr, uint8_
 bool queueCanRxMessage(Endpoint& serial, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]);
 
 }
+
+#endif
 
 #endif
