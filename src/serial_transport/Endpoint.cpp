@@ -11,7 +11,7 @@ using std::min;
 namespace serial_transport {
 
 // CRC-8-CCITT lookup table (polynomial 0x07, initial value 0x00)
-const uint8_t Endpoint::CRC8_TABLE[256] PROGMEM = {
+static const uint8_t CRC8_TABLE[256] PROGMEM = {
     0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15,
     0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
     0x70, 0x77, 0x7E, 0x79, 0x6C, 0x6B, 0x62, 0x65,
@@ -46,22 +46,36 @@ const uint8_t Endpoint::CRC8_TABLE[256] PROGMEM = {
     0x14, 0x13, 0x1A, 0x1D, 0x08, 0x0F, 0x06, 0x01
 };
 
-const char* describe(ErrorCode errorCode) {
-    switch (errorCode) {
-        case ErrorCode::ResendLimitExceeded: return "Resend limit exceeded";
-        case ErrorCode::BufferFull: return "Receive buffer full";
-        default: return "Unknown error code";
+const char* describe(WarningCode warning) {
+    switch (warning) {
+        case WarningCode::ResendLimitReached: return "Resend limit exceeded";
+        case WarningCode::RxBufferFull: return "Receive buffer full";
+        default: return "Unknown warning code";
     }
 }
 
-Endpoint::Endpoint(ReceiveCallback processReceived, ErrorCallback handleError) :
-    _processReceived(processReceived),
-    _handleError(handleError)
+unsigned long calculateTimeout(unsigned long baudRate) {
+    // Calculate timeout based on baud rate for optimal responsiveness
+    // Max frame: 64 bytes × 10 bits/byte = 640 bits
+    // Round-trip time (send DATA + receive ACK) with 5 times safety margin for processing/jitter
+    unsigned long timeout = (640UL * 1000UL * 5UL) / baudRate;
+    
+    // Clamp to reasonable range: 20-500ms
+    if (timeout < 20UL) timeout = 20UL;
+    if (timeout > 500UL) timeout = 500UL;
+    
+    return timeout;
+}
+
+Endpoint::Endpoint(ReceiveCallback receive, WarningCallback warn) :
+    _receive(receive),
+    _warn(warn)
 {}
 
 void Endpoint::setup(unsigned long baud, SerialConfig serialMode) {
+    _timeout = calculateTimeout(baud);
     Serial.begin(baud, serialMode);
-    Serial.setTimeout(2);
+    Serial.setTimeout(2);  
 }
 
 void Endpoint::reset() {
@@ -70,6 +84,7 @@ void Endpoint::reset() {
     _currentTxSequenceNumber = 0u;
     _currentRxSequenceNumber = 0u;
     _currentUnacknowledgedTxQueueIndex = 0u;
+
     for (auto& message : _txQueue) {
         message = QueuedMessage{};
     }
@@ -84,27 +99,195 @@ void Endpoint::reset() {
 
 void Endpoint::loop() {
     receive();
+    send();
+}
 
-    if (_timeoutEnabled && txMessageQueued()) {
-        QueuedMessage& currentMessage = currentUnacknowledgedMessage();
-        if ((currentMessage.sendTime + _timeout) < millis()) {
-            if (currentMessage.retries > 0u) {
-                send(currentMessage);
-                currentMessage.retries -= 1u;
+
+void Endpoint::receive() {
+    if (Serial.available() == 0) {
+        return;
+    }
+
+    // Try to read available bytes into buffer
+    size_t availableSpace = BUFFER_MAX_SIZE - _rxBufferSize;
+    if (availableSpace == 0) {
+        // Buffer is full - we've lost sync, discard everything and start fresh
+        _warn(WarningCode::RxBufferFull, *this);
+        _rxBufferSize = 0;
+        return;
+    }
+
+    size_t bytesRead = Serial.readBytes(&_rxBuffer[_rxBufferSize], availableSpace);
+    _rxBufferSize += bytesRead;
+
+    // State machine to parse binary frames
+    while (_rxBufferSize >= FRAME_MIN_SIZE) {
+        // Look for sync bytes
+        size_t syncIndex = 0;
+        bool foundSync = false;
+        
+        for (syncIndex = 0; syncIndex < _rxBufferSize - 1; ++syncIndex) {
+            if (_rxBuffer[syncIndex] == SYNC1 && _rxBuffer[syncIndex + 1] == SYNC2) {
+                foundSync = true;
+                break;
+            }
+        }
+
+        if (!foundSync) {
+            // No sync found, discard everything
+            _rxBufferSize = 0;
+            return;
+        }
+
+        if (syncIndex > 0) {
+            // Discard bytes before sync
+            memmove(_rxBuffer, &_rxBuffer[syncIndex], _rxBufferSize - syncIndex);
+            _rxBufferSize -= syncIndex;
+        }
+
+        if (_rxBufferSize < FRAME_MIN_SIZE) {
+            // Not enough data for frame header
+            return;
+        }
+
+        uint8_t type = _rxBuffer[2];
+        uint8_t length = _rxBuffer[3];
+        uint8_t seq = _rxBuffer[4];
+
+        // Validate length
+        if (length > PAYLOAD_MAX_SIZE) {
+            // Invalid length, discard sync bytes and look for next frame
+            memmove(_rxBuffer, &_rxBuffer[2], _rxBufferSize - 2);
+            _rxBufferSize -= 2;
+            continue;
+        }
+
+        size_t frameSize = FRAME_OVERHEAD + static_cast<size_t>(length);
+        if (_rxBufferSize < frameSize) {
+            // Not enough data for complete frame
+            return;
+        }
+
+        // Verify CRC (covers TYPE + LENGTH + SEQ + PAYLOAD, not the sync bytes or CRC itself)
+        uint8_t expectedCrc = calculateCrc8(&_rxBuffer[2], 3 + length);
+        uint8_t receivedCrc = _rxBuffer[5 + length];
+
+        if (expectedCrc != receivedCrc) {
+            // CRC mismatch, discard sync bytes and look for next frame
+            memmove(_rxBuffer, &_rxBuffer[2], _rxBufferSize - 2);
+            _rxBufferSize -= 2;
+            continue;
+        }
+
+        // Frame is valid, extract and handle it
+        uint8_t* payload = (length > 0) ? &_rxBuffer[5] : nullptr;
+        handleFrame(type, seq, payload, length);
+
+        // Remove processed frame from buffer
+        memmove(_rxBuffer, &_rxBuffer[frameSize], _rxBufferSize - frameSize);
+        _rxBufferSize -= frameSize;
+    }
+}
+
+void Endpoint::handleFrame(uint8_t type, uint8_t seq, const uint8_t* payload, uint8_t payloadLen) {
+    switch (type) {
+        case FRAME_TYPE_DATA: {
+            const uint8_t expectedSeq = _currentRxSequenceNumber + 1u;
+            if (seq == expectedSeq) {
+                // In-order frame: accept and ACK
+                _currentRxSequenceNumber = seq;
+                sendAcknowledge(seq);
+
+                // Null-terminate payload and process it
+                if (payloadLen > 0 && payloadLen < PAYLOAD_MAX_SIZE) {
+                    char message[PAYLOAD_MAX_SIZE + 1];
+                    memcpy(message, payload, payloadLen);
+                    message[payloadLen] = '\0';
+                    _receive(message, *this);
+                } else if (payloadLen == 0) {
+                    // Empty message (shouldn't happen normally, but handle gracefully)
+                    char emptyMsg[1] = { '\0' };
+                    _receive(emptyMsg, *this);
+                }
+            } else if (seq == _currentRxSequenceNumber) {
+                // Duplicate frame: re-ACK (our ACK might have been lost)
+                sendAcknowledge(_currentRxSequenceNumber);
             } else {
-                _handleError(ErrorCode::ResendLimitExceeded, *this);
-                acknowledgeCurrentUnacknowledgedMessage();
+                // Out of order (likely missed frame): ACK last good to trigger resend
+                sendAcknowledge(_currentRxSequenceNumber);
+            }
+            break;
+        }
+        case FRAME_TYPE_ACK: {
+            handleAcknowledge(seq);
+            break;
+        }
+        default:
+            // Unknown frame type - ignore
+            break;
+    }
+}
+
+void Endpoint::handleAcknowledge(uint8_t sequenceNumber) {
+    QueuedMessage& currentMessage = currentUnacknowledgedMessage();
+    if (!currentMessage.acknowledged && currentMessage.sequenceNumber == sequenceNumber) {
+        acknowledgeCurrentUnacknowledgedMessage();
+        send();
+    }
+}
+
+void Endpoint::send() {
+    if (txMessageQueued()) {
+        QueuedMessage& message = currentUnacknowledgedMessage();
+        if ((message.sendTime + _timeout) < millis()) {
+            if (send(message)) {
+                message.sendTime = millis();
+                message.retries -= 1u;
+
+                if (message.retries == 0u) {
+                    _warn(WarningCode::ResendLimitReached, *this);
+                    message.retries = _resendLimit;
+                }
             }
         }
     }
 }
 
-bool Endpoint::canQueue() const {
-    return _txQueue[nextTxQueueIndex()].acknowledged;
+bool Endpoint::send(QueuedMessage& message) {
+    if (Serial.availableForWrite() < ((message.payloadSize / 2) + FRAME_OVERHEAD)) {
+        return false;
+    }
+
+    message.acknowledged = false;
+    message.sendTime = millis();
+    
+    sendFrame(FRAME_TYPE_DATA, message.sequenceNumber, 
+              reinterpret_cast<const uint8_t*>(message.payload), 
+              static_cast<uint8_t>(message.payloadSize));
+    
+    return true;
 }
 
-bool Endpoint::canSend(size_t queueIndex) const {
-    return _currentUnacknowledgedTxQueueIndex == queueIndex;
+void Endpoint::sendAcknowledge(uint8_t sequenceNumber) {
+    sendFrame(FRAME_TYPE_ACK, sequenceNumber, nullptr, 0);
+}
+
+void Endpoint::sendFrame(uint8_t type, uint8_t seq, const uint8_t* payload, uint8_t payloadLen) {
+    uint8_t frameData[BUFFER_MAX_SIZE];
+    frameData[0] = SYNC1;
+    frameData[1] = SYNC2;
+    frameData[2] = type;
+    frameData[3] = payloadLen;
+    frameData[4] = seq;
+    
+    if (payloadLen > 0 && payload != nullptr) {
+        memcpy(&frameData[5], payload, payloadLen);
+    }
+    
+    uint8_t crc = calculateCrc8(&frameData[2], 3 + payloadLen);
+    frameData[5 + payloadLen] = crc;
+    
+    Serial.write(frameData, 6 + payloadLen);
 }
 
 bool Endpoint::queue(const char* fmt, ...) {
@@ -138,6 +321,14 @@ bool Endpoint::queue(const char* fmt, ...) {
     return true;
 }
 
+bool Endpoint::canQueue() const {
+    return _txQueue[nextTxQueueIndex()].acknowledged;
+}
+
+bool Endpoint::canSend(size_t queueIndex) const {
+    return _currentUnacknowledgedTxQueueIndex == queueIndex;
+}
+
 uint8_t Endpoint::calculateCrc8(const uint8_t* data, size_t length) const {
     uint8_t crc = 0x00u;
     for (size_t i = 0; i < length; ++i) {
@@ -145,37 +336,6 @@ uint8_t Endpoint::calculateCrc8(const uint8_t* data, size_t length) const {
         crc = pgm_read_byte(&CRC8_TABLE[tableIndex]);
     }
     return crc;
-}
-
-void Endpoint::sendFrame(uint8_t type, uint8_t seq, const uint8_t* payload, uint8_t payloadLen) {
-    uint8_t frameData[BUFFER_MAX_SIZE];
-    frameData[0] = SYNC1;
-    frameData[1] = SYNC2;
-    frameData[2] = type;
-    frameData[3] = payloadLen;
-    frameData[4] = seq;
-    
-    if (payloadLen > 0 && payload != nullptr) {
-        memcpy(&frameData[5], payload, payloadLen);
-    }
-    
-    uint8_t crc = calculateCrc8(&frameData[2], 3 + payloadLen);
-    frameData[5 + payloadLen] = crc;
-    
-    Serial.write(frameData, 6 + payloadLen);
-}
-
-void Endpoint::send(QueuedMessage& message) {
-    message.acknowledged = false;
-    message.sendTime = millis();
-    
-    sendFrame(FRAME_TYPE_DATA, message.sequenceNumber, 
-              reinterpret_cast<const uint8_t*>(message.payload), 
-              static_cast<uint8_t>(message.payloadSize));
-}
-
-void Endpoint::sendAcknowledge(uint8_t sequenceNumber) {
-    sendFrame(FRAME_TYPE_ACK, sequenceNumber, nullptr, 0);
 }
 
 const Endpoint::QueuedMessage& Endpoint::currentUnacknowledgedMessage() const {
@@ -218,154 +378,6 @@ size_t Endpoint::incrementCurrentUnacknowledgedTxQueueIndex() {
 
 uint8_t Endpoint::incrementTxSequenceNumber() {
     return ++_currentTxSequenceNumber;
-}
-
-uint8_t Endpoint::incrementRxSequenceNumber() {
-    return ++_currentRxSequenceNumber;
-}
-
-void Endpoint::receive() {
-    if (Serial.available() == 0) {
-        return;
-    }
-
-    // Try to read available bytes into buffer
-    size_t availableSpace = BUFFER_MAX_SIZE - _rxBufferSize;
-    if (availableSpace == 0) {
-        // Buffer is full, signal error and discard oldest byte to recover
-        _handleError(ErrorCode::BufferFull, *this);
-        _rxBufferSize = BUFFER_MAX_SIZE - 1;
-        memmove(_rxBuffer, _rxBuffer + 1, _rxBufferSize);
-        availableSpace = 1;
-    }
-
-    size_t bytesRead = Serial.readBytes(&_rxBuffer[_rxBufferSize], availableSpace);
-    _rxBufferSize += bytesRead;
-
-    // State machine to parse binary frames
-    while (_rxBufferSize >= 6) {  // Minimum frame size: SYNC1 + SYNC2 + TYPE + LENGTH + SEQ + CRC8
-        // Look for sync bytes
-        size_t syncIndex = 0;
-        bool foundSync = false;
-        
-        for (syncIndex = 0; syncIndex < _rxBufferSize - 1; ++syncIndex) {
-            if (_rxBuffer[syncIndex] == SYNC1 && _rxBuffer[syncIndex + 1] == SYNC2) {
-                foundSync = true;
-                break;
-            }
-        }
-
-        if (!foundSync) {
-            // No sync found, discard everything
-            _rxBufferSize = 0;
-            return;
-        }
-
-        if (syncIndex > 0) {
-            // Discard bytes before sync
-            memmove(_rxBuffer, &_rxBuffer[syncIndex], _rxBufferSize - syncIndex);
-            _rxBufferSize -= syncIndex;
-        }
-
-        if (_rxBufferSize < 6) {
-            // Not enough data for frame header
-            return;
-        }
-
-        uint8_t type = _rxBuffer[2];
-        uint8_t length = _rxBuffer[3];
-        uint8_t seq = _rxBuffer[4];
-
-        // Validate length
-        if (length > PAYLOAD_MAX_SIZE) {
-            // Invalid length, discard sync bytes and look for next frame
-            memmove(_rxBuffer, &_rxBuffer[2], _rxBufferSize - 2);
-            _rxBufferSize -= 2;
-            continue;
-        }
-
-        size_t frameSize = 6 + length;  // SYNC1 + SYNC2 + TYPE + LENGTH + SEQ + PAYLOAD + CRC8
-        if (_rxBufferSize < frameSize) {
-            // Not enough data for complete frame
-            return;
-        }
-
-        // Verify CRC (covers TYPE + LENGTH + SEQ + PAYLOAD, not the sync bytes or CRC itself)
-        uint8_t expectedCrc = calculateCrc8(&_rxBuffer[2], 3 + length);
-        uint8_t receivedCrc = _rxBuffer[5 + length];
-
-        if (expectedCrc != receivedCrc) {
-            // CRC mismatch, discard sync bytes and look for next frame
-            memmove(_rxBuffer, &_rxBuffer[2], _rxBufferSize - 2);
-            _rxBufferSize -= 2;
-            continue;
-        }
-
-        // Frame is valid, extract and handle it
-        uint8_t* payload = (length > 0) ? &_rxBuffer[5] : nullptr;
-        handleFrame(type, seq, payload, length);
-
-        // Remove processed frame from buffer
-        memmove(_rxBuffer, &_rxBuffer[frameSize], _rxBufferSize - frameSize);
-        _rxBufferSize -= frameSize;
-    }
-}
-
-void Endpoint::handleFrame(uint8_t type, uint8_t seq, const uint8_t* payload, uint8_t payloadLen) {
-    switch (type) {
-        case FRAME_TYPE_DATA: {
-            const uint8_t expectedSeq = _currentRxSequenceNumber + 1u; // Expect next in-order frame
-            if (seq == expectedSeq) {
-                _currentRxSequenceNumber = seq;
-                sendAcknowledge(seq);
-
-                // Null-terminate payload and process it
-                if (payloadLen > 0 && payloadLen < PAYLOAD_MAX_SIZE) {
-                    char message[PAYLOAD_MAX_SIZE + 1];
-                    memcpy(message, payload, payloadLen);
-                    message[payloadLen] = '\0';
-                    _processReceived(message, *this);
-                } else if (payloadLen == 0) {
-                    // Empty message (shouldn't happen normally, but handle gracefully)
-                    char emptyMsg[1] = { '\0' };
-                    _processReceived(emptyMsg, *this);
-                }
-            } else {
-                // Out of sequence, send last ACK again to trigger a re-send
-                sendAcknowledge(_currentRxSequenceNumber);
-            }
-            break;
-        }
-        case FRAME_TYPE_ACK: {
-            handleAcknowledge(seq);
-            break;
-        }
-        case FRAME_TYPE_TIMEOUT_CONTROL: {
-            if (payloadLen == 1) {
-                handleTimeoutControl(payload[0]);
-            }
-            break;
-        }
-    }
-}
-
-void Endpoint::handleAcknowledge(uint8_t sequenceNumber) {
-    QueuedMessage& currentMessage = currentUnacknowledgedMessage();
-    if (!currentMessage.acknowledged && currentMessage.sequenceNumber == sequenceNumber) {
-        acknowledgeCurrentUnacknowledgedMessage();
-        QueuedMessage& nextMessage = currentUnacknowledgedMessage();
-        if (!nextMessage.acknowledged && canSend(_currentUnacknowledgedTxQueueIndex)) {
-            send(nextMessage);
-        }
-    }
-}
-
-void Endpoint::handleTimeoutControl(uint8_t operation) {
-    if (operation == '+') {
-        _timeoutEnabled = true;
-    } else if (operation == '-') {
-        _timeoutEnabled = false;
-    }
 }
 
 bool queueCanMessage(Endpoint& serial, const char* direction, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]) {
