@@ -3,7 +3,7 @@
 
 #define PROGMEM
 #define pgm_read_byte(x) *(x)
-#define SERIAL_8E1 0
+#define SERIAL_8N1 0
 
 #include <cstdio>
 #include <cassert>

@@ -17,20 +17,26 @@ namespace serial_transport {
 
 class Endpoint;
 
-enum struct ConnectionState {
-    UNSYNCED = 0,   // Need to send SYN
-    SYNCING = 1,    // SYN sent, waiting for peer's ACK  
-    SYNCED = 2      // SYN + ACK complete, normal DATA/ACK operation
+enum struct EndpointRole : uint8_t {
+    CLIENT = 0,
+    SERVER = 1,
+};
+
+enum struct ConnectionState : uint8_t {
+    CLOSED     = 0, // Endpoint is closed
+    LISTENING  = 1, // Listening for incoming connection (SYN)
+    WAITING    = 2, // SYN / SYNACK sent, waiting for SYNACK / ACK
+    CONNECTED  = 3,  // SYN + SYNACK + ACK complete, normal DATA/ACK operation
 };
 
 const char* describe(ConnectionState state);
 
 #if defined(ARDUINO_AVR_NANO)
-using ReceiveCallback = void (*)(const char* message, Endpoint& serial);
+using ReceiveCallback = void (*)(const uint8_t* payload, uint8_t payloadLen, Endpoint& serial);
 using StateCallback = void (*)(ConnectionState state, Endpoint& serial);
 using FrameCallback = void (*)(char direction, uint8_t type, uint8_t sequenceNumber, const uint8_t* payload, uint8_t payloadLen);
 #else
-using ReceiveCallback = std::function<void(const char* message, Endpoint& serial)>;
+using ReceiveCallback = std::function<void(const uint8_t* payload, uint8_t payloadLen, Endpoint& serial)>;
 using StateCallback = std::function<void(ConnectionState state, Endpoint& serial)>;
 using FrameCallback = std::function<void(char direction, uint8_t type, uint8_t sequenceNumber, const uint8_t* payload, uint8_t payloadLen)>;
 #endif
@@ -42,7 +48,7 @@ using FrameCallback = std::function<void(char direction, uint8_t type, uint8_t s
  * [SYNC1:0x5A] [SYNC2:0xA5] [TYPE] [LENGTH] [SEQ] [PAYLOAD...] [CRC8]
  * 
  * SYNC1/SYNC2: 2 bytes, frame start marker (0x5A 0xA5)
- * TYPE: Frame type (0x01=DATA, 0x02=ACK, 0x03=SYN)
+ * TYPE: Frame type (0x01=DATA, 0x02=ACK, 0x03=SYN, 0x04=SYNACK, 0xFF=DEBUG)
  * LENGTH: Payload length (0-57 bytes max)
  * SEQ: Sequence number (0-255, wraps around)
  * PAYLOAD: Up to 57 bytes of data
@@ -51,36 +57,31 @@ using FrameCallback = std::function<void(char direction, uint8_t type, uint8_t s
  * Total frame size: 2 + 3 header + payload + 1 CRC = max 64 bytes
  * 
  * Synchronization protocol (TCP-like):
- * - On startup or after error, endpoints send SYN frames to synchronize their sequence number
- * - SYN frame SEQ field contains the sequence number for the NEXT DATA frame
- * - On receiving SYN, endpoint updates expected RX sequence and responds with ACK
+ * - Endpoints can operate in CLIENT or SERVER role
+ * - On startup/after reset, CLIENT sends SYN to SERVER
+ * - SERVER responds with SYNACK
+ * - CLIENT responds with ACK to complete handshake
+ * - SYN(ACK) frame SEQ field contains the sequence number for the NEXT DATA frame
+ * - On receiving SYN(ACK), endpoint updates expected RX sequence and responds with SYNACK/ACK
  * - Only DATA frames are sent after successful synchronization
-  * 
+ * - If at any time a frame is received in an invalid state, a RESET (RST) frame is sent to restart the connection.
+ * 
  * Connection states:
- * - UNSYNCED: No sync established, send SYN frames periodically
- * - SYNCING: SYN sent, waiting for peer's ACK response
- * - SYNCED: Both sides synchronized, normal DATA/ACK operation
+ * - CLOSED: Endpoint is closed
+ * - LISTENING: Listening for incoming connection (SYN)
+ * - CONNECTING: SYN / SYNACK sent, waiting for SYNACK / ACK
+ * - CONNECTED: SYN + SYNACK + ACK complete, normal DATA/ACK operation
  * 
  * Timeout handling:
  * - Calculated automatically based on baud rate (typically 20-100ms at 115200 baud)
- * - High retry limit (200) allows automatic recovery from transient issues
+ * - High retry limit (250) allows automatic recovery from transient issues
  * - ResendLimitReached warning triggers resynchronization attempt
- * 
- * Payloads (unchanged from ASCII protocol):
- * READY\n
- * SETUP FFFFFFFF NOR|LOP|SLP|LIS\n
- * SETUP OK 9 64 8 8 8 4 1 1234567890 1 1234567890\n
- * SETUP EFFFF: FFFFFFFF NOR|LOP|SLP|LIS\n
- * CANRX FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
- * CANTX FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
- * CANTX OK FFFFFFFF 8 01 02 03 04 05 06 07 08 \n
- * etc.
  */
 class Endpoint final {
 private:
     static const unsigned long DEFAULT_BAUD_RATE = 115200ul;
-    static const SerialConfig DEFAULT_SERIAL_MODE = SERIAL_8E1;
-    static const uint8_t DEFAULT_RESEND_LIMIT = 200u;
+    static const SerialConfig DEFAULT_SERIAL_MODE = SERIAL_8N1;
+    static const uint8_t DEFAULT_RESEND_LIMIT = 250u;
     static const unsigned long SYN_RETRY_INTERVAL = 150ul;
 
     static constexpr uint8_t SYNC1 = 0x5Au;
@@ -89,6 +90,8 @@ private:
     static constexpr uint8_t FRAME_TYPE_DATA = 0x01u;
     static constexpr uint8_t FRAME_TYPE_ACK = 0x02u;
     static constexpr uint8_t FRAME_TYPE_SYN = 0x03u;
+    static constexpr uint8_t FRAME_TYPE_SYNACK = 0x04u;
+    static constexpr uint8_t FRAME_TYPE_RST = 0x05u;
     static constexpr uint8_t FRAME_TYPE_DBG = 0xFFu;
 
     static constexpr uint8_t BUFFER_MAX_SIZE = 64u;
@@ -108,7 +111,7 @@ private:
 #endif
 
     struct QueuedMessage {
-        char payload[PAYLOAD_MAX_SIZE] = {};
+        uint8_t payload[PAYLOAD_MAX_SIZE] = {};
         uint8_t payloadSize = 0u;
         uint8_t sequenceNumber = 0u;
         uint8_t retries = 0u;
@@ -116,7 +119,7 @@ private:
         unsigned long sendTime = 0u;
     };
 
-    ConnectionState _connectionState = ConnectionState::UNSYNCED;
+    ConnectionState _connectionState = ConnectionState::CLOSED;
     unsigned long _lastSynSendTime = 0u;
     unsigned long _lastDiagnosticsTime = 0u;
     
@@ -139,23 +142,28 @@ private:
 
     SerialType& _serial;
 
-    bool _debugEnabled = false;
+    bool _diagnosticsEnabled = false;
+
+    EndpointRole _role = EndpointRole::CLIENT;
 
     void setConnectionState(ConnectionState state);
 
     void receive();
     uint8_t calculateCrc8(const uint8_t* data, size_t length) const;
     void handleFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* payload, uint8_t payloadLen);
+    void handleData(uint8_t sequenceNumber, const uint8_t* payload, uint8_t payloadLen);
     void handleSyn(uint8_t sequenceNumber);
+    void handleSynAcknowledge(uint8_t sequenceNumber, uint8_t acknowledgedSeqNumber);
     void handleAcknowledge(uint8_t sequenceNumber);
+    void handleReset();
     void incrementFirstTxQueueIndex();
 
-    void sync();
-
-    void send();
+    void trySend();
     void sendSyn();
+    void sendSynAcknowledge();
     void sendAcknowledge(uint8_t sequenceNumber);
-    bool send(QueuedMessage &message);
+    void sendReset();
+    bool sendData(QueuedMessage &message);
     bool canWrite(const serial_transport::Endpoint::QueuedMessage& message);
     void sendFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* payload, uint8_t payloadLen);
     
@@ -168,24 +176,26 @@ private:
     uint8_t lastTxSequenceNumber() const;
 
     uint8_t nextTxSequenceNumberToSend() const;
+
+    void sendDiagnostics();
     
 public:
-    Endpoint(SerialType& serial, ReceiveCallback receive = nullptr, StateCallback notifyState = nullptr, FrameCallback frame = nullptr);
+    Endpoint(EndpointRole role, SerialType& serial, ReceiveCallback receive = nullptr, StateCallback notifyState = nullptr, FrameCallback frame = nullptr);
 
     void setup(unsigned long baud = DEFAULT_BAUD_RATE, SerialConfig serialMode = DEFAULT_SERIAL_MODE);
     void reset();
+    ConnectionState connectionState() const { return _connectionState; }
     void loop();
-    bool queue(const char* fmt, ...);
     bool canQueue() const;
-
+    bool queue(const char* fmt, ...);
+    bool queue(const uint8_t* data, uint8_t length);
+    
     bool hasQueuedTxMessage() const;
     uint8_t numberOfQueuedMessages() const;
     
-    ConnectionState connectionState() const { return _connectionState; }
-
-    void enableDebug(bool enabled);
     void sendDebug(const char* fmt, ...);
-
+    void enableDiagnostics(bool enabled);
+    
     void setReceiveCallback(ReceiveCallback callback) { _receive = callback; }
     void setStateCallback(StateCallback callback) { _notifyState = callback; }
     void setFrameCallback(FrameCallback callback) { _frame = callback; }

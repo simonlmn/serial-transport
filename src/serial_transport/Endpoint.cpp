@@ -47,10 +47,11 @@ static const uint8_t CRC8_TABLE[256] PROGMEM = {
 
 const char* describe(ConnectionState state)  {
     switch (state) {
-        case ConnectionState::UNSYNCED: return "Not synced, sending blocked.";
-        case ConnectionState::SYNCING: return "Waiting for synchronization.";
-        case ConnectionState::SYNCED: return "Ready to send.";
-        default: return "UNKNOWN";
+        case ConnectionState::CLOSED:     return "Endpoint is closed.";
+        case ConnectionState::LISTENING:  return "Listening for incoming connection.";
+        case ConnectionState::WAITING:    return "Waiting for connection to establish.";
+        case ConnectionState::CONNECTED:  return "Connected to remote endpoint.";
+        default:                          return "UNKNOWN";
     }
 }
 
@@ -71,7 +72,8 @@ constexpr uint8_t wrapSequenceNumber(int sequenceNumber) {
     return static_cast<uint8_t>(sequenceNumber & 0xFFu);
 }
 
-Endpoint::Endpoint(SerialType& serial, ReceiveCallback receive, StateCallback notifyState, FrameCallback frame) :
+Endpoint::Endpoint(EndpointRole role, SerialType& serial, ReceiveCallback receive, StateCallback notifyState, FrameCallback frame) :
+    _role(role),
     _serial(serial),
     _receive(receive),
     _notifyState(notifyState),
@@ -86,7 +88,6 @@ void Endpoint::setup(unsigned long baud, SerialConfig serialMode) {
 }
 
 void Endpoint::reset() {
-    setConnectionState(ConnectionState::UNSYNCED);
     _lastSynSendTime = 0u;
 
     _rxBufferSize = 0u;
@@ -104,29 +105,7 @@ void Endpoint::reset() {
         _serial.read();
         yield();
     }
-}
-
-void Endpoint::loop() {
-    receive();
-    if (_connectionState == ConnectionState::SYNCED) {
-        send();
-        
-        if (_debugEnabled && (_lastDiagnosticsTime == 0u || (millis() - _lastDiagnosticsTime) >= 1000u)) {
-            _lastDiagnosticsTime = millis();
-
-            sendDebug("RxS=%u|Tx^=%u|Tx$=%u|#Tx=%u|TxS=%u|Q?=%s|W?=%s",
-                _lastRxSequenceNumber,
-                _firstTxQueueIndex,
-                _lastTxQueueIndex,
-                numberOfQueuedMessages(),
-                firstTxSequenceNumber(),
-                hasQueuedTxMessage() ? "Y" : "N",
-                canWrite(firstTxQueueMessage()) ? "Y" : "N"
-            );
-        }
-    } else {
-        sync();
-    }
+    setConnectionState(ConnectionState::CLOSED);
 }
 
 void Endpoint::setConnectionState(ConnectionState state) {
@@ -136,9 +115,45 @@ void Endpoint::setConnectionState(ConnectionState state) {
             _notifyState(state, *this);    
         }
 
-        if (_debugEnabled) {
+        if (_diagnosticsEnabled) {
             sendDebug("CS=%u", state);
         }
+    }
+}
+
+void Endpoint::loop() {
+    if (_connectionState != ConnectionState::CLOSED) {
+        receive();
+    }
+
+    switch (_connectionState) {
+        case ConnectionState::CLOSED:
+            if (_role == EndpointRole::SERVER) {
+                setConnectionState(ConnectionState::LISTENING);
+            } else {
+                sendSyn();
+                setConnectionState(ConnectionState::WAITING);
+            }
+            break;
+        case ConnectionState::LISTENING:
+            // Wait for incoming SYN
+            break;
+        case ConnectionState::WAITING:
+            // Resend SYN/SYNACK periodically
+            if (millis() - _lastSynSendTime >= _timeout) {
+                if (_role == EndpointRole::SERVER) {
+                    sendSynAcknowledge();
+                } else {
+                    sendSyn();
+                }
+            }
+            break;
+        case ConnectionState::CONNECTED:
+            trySend();
+            if (_diagnosticsEnabled && (_lastDiagnosticsTime == 0u || (millis() - _lastDiagnosticsTime) >= 1000u)) {
+                sendDiagnostics();
+            }
+            break;
     }
 }
 
@@ -218,15 +233,22 @@ void Endpoint::receive() {
         }
 
         // Frame is valid, extract and handle it
-        // We can directly write the zero-termination at the end of the payload (overwriting CRC byte),
-        // as we have already checked it and will discard the frame afterwards anyway.
+        // We can directly write a zero-termination at the end of the payload (overwriting CRC byte),
+        // as we have already checked it and will discard the frame afterwards anyway. This allows
+        // direct handling of payload as string in callbacks.
         uint8_t* payload = &_rxBuffer[FRAME_HEADER_SIZE];
         payload[length] = '\0';
         handleFrame(type, sequenceNumber, payload, length);
 
-        // Remove processed frame from buffer
-        memmove(_rxBuffer, &_rxBuffer[frameSize], _rxBufferSize - frameSize);
-        _rxBufferSize -= frameSize;
+        // Note: this condition also guards against invalid length calculation due to a reset() inside handleFrame()
+        if (_rxBufferSize > frameSize) {
+            // Remove processed frame from buffer
+            memmove(_rxBuffer, &_rxBuffer[frameSize], _rxBufferSize - frameSize);
+            _rxBufferSize -= frameSize;
+        } else {
+            // No more data in buffer
+            _rxBufferSize = 0;
+        }
     }
 }
 
@@ -240,7 +262,7 @@ uint8_t Endpoint::calculateCrc8(const uint8_t* data, size_t length) const {
 }
 
 void Endpoint::handleFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* payload, uint8_t payloadLen) {
-    if (_debugEnabled) {
+    if (_diagnosticsEnabled) {
         sendDebug("RX:T=%02X|S=%u|L=%u", type, sequenceNumber, payloadLen);
     }
     if (_frame) {
@@ -248,15 +270,7 @@ void Endpoint::handleFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* 
     }
     switch (type) {
         case FRAME_TYPE_DATA: {
-            if (sequenceNumber == wrapSequenceNumber(_lastRxSequenceNumber + 1u)) {
-                // In-order frame: accept and ACK
-                _lastRxSequenceNumber = sequenceNumber;
-                sendAcknowledge(sequenceNumber);
-                if (_receive) _receive(reinterpret_cast<const char*>(payload), *this);
-            } else {
-                // Duplicate or out of order (likely missed frame): ACK last known again
-                sendAcknowledge(_lastRxSequenceNumber);
-            }
+            handleData(sequenceNumber, payload, payloadLen);
             break;
         }
 
@@ -270,6 +284,18 @@ void Endpoint::handleFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* 
             break;
         }
 
+        case FRAME_TYPE_SYNACK: {
+            if (payloadLen == 1u) {
+                handleSynAcknowledge(sequenceNumber, payload[0]);
+            }
+            break;
+        }
+
+        case FRAME_TYPE_RST: {
+            handleReset();
+            break;
+        }
+
         case FRAME_TYPE_DBG: {
             // Ignore, debug frames are not acknowledged
             // Can be handled via FrameCallback if needed
@@ -278,37 +304,118 @@ void Endpoint::handleFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* 
     }
 }
 
+void Endpoint::handleData(uint8_t sequenceNumber, const uint8_t* payload, uint8_t payloadLen) {
+    switch (_connectionState) {
+        case ConnectionState::CLOSED:
+        case ConnectionState::LISTENING:
+            // Remote sending DATA when not connected, send RST
+            sendReset();
+            break;
+        case ConnectionState::WAITING:
+            // Ignore DATA when in SYN/ACK phase
+            return;
+        case ConnectionState::CONNECTED:
+            if (sequenceNumber == wrapSequenceNumber(_lastRxSequenceNumber + 1u)) {
+                _lastRxSequenceNumber = sequenceNumber;
+                sendAcknowledge(sequenceNumber);
+                if (_receive) _receive(payload, payloadLen, *this);
+            } else {
+                // Duplicate or out of order (likely missed frame): ACK last known again
+                sendAcknowledge(_lastRxSequenceNumber);
+            }
+            break;
+    }
+}
+
 void Endpoint::handleSyn(uint8_t sequenceNumber) {
-    // sequenceNumber is the sequence number the other side will use for its next DATA frame
-    _lastRxSequenceNumber = wrapSequenceNumber(sequenceNumber - 1u);
-    sendAcknowledge(_lastRxSequenceNumber);
+    if (_role != EndpointRole::SERVER) {
+        return;
+    }
+    
+    switch (_connectionState) {
+        case ConnectionState::CLOSED:
+            // Ignore SYN when closed
+            break;
+        case ConnectionState::LISTENING:
+            // sequenceNumber is the sequence number the other side will use for its next DATA frame
+            _lastRxSequenceNumber = wrapSequenceNumber(sequenceNumber - 1u);
+            sendSynAcknowledge();
+            setConnectionState(ConnectionState::WAITING);
+            break;
+        case ConnectionState::WAITING:
+            // Retransmitted SYN, resend SYNACK
+            sendSynAcknowledge();
+            break;
+        case ConnectionState::CONNECTED:
+            // Remote was disconnected, reset
+            reset();
+            break;
+    }
+}
+
+void Endpoint::handleSynAcknowledge(uint8_t sequenceNumber, uint8_t acknowledgedSeqNumber) {
+    if (_role != EndpointRole::CLIENT) {
+        return;
+    }
+
+    switch (_connectionState) {
+        case ConnectionState::CLOSED:
+            // Ignore SYNACK when closed
+            break;
+        case ConnectionState::LISTENING:
+            // Client should not be in LISTENING state!
+            reset();
+            sendReset();
+            break;
+        case ConnectionState::WAITING:
+            // Verify that our SYN was acknowledged
+            if (acknowledgedSeqNumber == wrapSequenceNumber(nextTxSequenceNumberToSend() - 1u)) {
+                // sequenceNumber is the sequence number the other side will use for its next DATA frame
+                _lastRxSequenceNumber = wrapSequenceNumber(sequenceNumber - 1u);
+                sendAcknowledge(_lastRxSequenceNumber);
+                setConnectionState(ConnectionState::CONNECTED);
+            }
+            break;
+        case ConnectionState::CONNECTED:
+            // Repeat ACK if already connected, remote might have missed it
+            sendAcknowledge(wrapSequenceNumber(sequenceNumber - 1u));
+            break;
+    }
 }
 
 void Endpoint::handleAcknowledge(uint8_t sequenceNumber) {
     switch (_connectionState) {
-        case ConnectionState::SYNCED:
+        case ConnectionState::CLOSED:
+            // Ignore ACKs when closed
+            break;
+        case ConnectionState::LISTENING:
+            // Remote sending ACK when not connected, send RST
+            sendReset();
+            break;
+        case ConnectionState::WAITING:
+            if (_role == EndpointRole::SERVER) {
+                // Verify that our SYNACK was acknowledged
+                if (sequenceNumber == wrapSequenceNumber(nextTxSequenceNumberToSend() - 1u)) {
+                    setConnectionState(ConnectionState::CONNECTED);
+                }
+            }
+            break;
+        case ConnectionState::CONNECTED:
             // Normal operation: mark message as acknowledged
             if (hasQueuedTxMessage()) {
                 QueuedMessage& message = firstTxQueueMessage();
                 if (message.acknowledged == 0u && message.sequenceNumber == sequenceNumber) {
                     message.acknowledged = 1u;
                     incrementFirstTxQueueIndex();
-                    send();
+                    trySend();
                 }
             }
             break;
-
-        case ConnectionState::SYNCING:
-            // Transition to SYNCED state upon receiving ACK to our SYN
-            if (sequenceNumber == wrapSequenceNumber(nextTxSequenceNumberToSend() - 1u)) {
-                setConnectionState(ConnectionState::SYNCED);
-            }
-            break;
-
-        case ConnectionState::UNSYNCED:
-            // Ignore ACKs when unsynced
-            break;
     }
+}
+
+void Endpoint::handleReset() {
+    reset();
 }
 
 void Endpoint::incrementFirstTxQueueIndex() {
@@ -318,17 +425,8 @@ void Endpoint::incrementFirstTxQueueIndex() {
     _firstTxQueueIndex = (_firstTxQueueIndex + 1u) % TX_QUEUE_SIZE;
 }
 
-void Endpoint::sync() {
-    if (_connectionState != ConnectionState::SYNCED) {
-        if (_lastSynSendTime == 0 || (millis() - _lastSynSendTime >= SYN_RETRY_INTERVAL)) {
-            sendSyn();
-            setConnectionState(ConnectionState::SYNCING);
-        }
-    }
-}
-
-void Endpoint::send() {
-    if (_connectionState != ConnectionState::SYNCED) {
+void Endpoint::trySend() {
+    if (_connectionState != ConnectionState::CONNECTED) {
         return;
     }
     if (!hasQueuedTxMessage()) {
@@ -341,15 +439,12 @@ void Endpoint::send() {
     if (message.sendTime != 0u && millis() < (message.sendTime + _timeout)) {
         return;
     }
-    if (!send(message)) {
+    if (!sendData(message)) {
         return;
     }
     if (message.retries == 0u) {
-        message.retries = _resendLimit;
-
-        // Trigger resynchronization
-        setConnectionState(ConnectionState::UNSYNCED);
-        _lastSynSendTime = 0u;
+        reset();
+        sendReset();
     }
 }
 
@@ -358,14 +453,21 @@ void Endpoint::sendSyn() {
     _lastSynSendTime = millis();
 }
 
+void Endpoint::sendSynAcknowledge() {
+    _txFrameBuffer[0] = _lastRxSequenceNumber;
+    sendFrame(FRAME_TYPE_SYNACK, nextTxSequenceNumberToSend(), _txFrameBuffer, 1);
+    _lastSynSendTime = millis();
+}
+
 void Endpoint::sendAcknowledge(uint8_t sequenceNumber) {
     sendFrame(FRAME_TYPE_ACK, sequenceNumber, nullptr, 0);
 }
 
-bool Endpoint::send(QueuedMessage& message) {
-    if (_connectionState != ConnectionState::SYNCED) {
-        return false;
-    }
+void Endpoint::sendReset() {
+    sendFrame(FRAME_TYPE_RST, 0, nullptr, 0);
+}
+
+bool Endpoint::sendData(QueuedMessage& message) {
     if (canWrite(message))
     {
         return false;
@@ -418,7 +520,7 @@ bool Endpoint::queue(const char* fmt, ...) {
 
     va_list args;
     va_start(args, fmt);
-    int payloadSize = vsnprintf(message.payload, PAYLOAD_MAX_SIZE, fmt, args);
+    int payloadSize = vsnprintf(reinterpret_cast<char*>(message.payload), PAYLOAD_MAX_SIZE, fmt, args);
     va_end(args);
 
     if (payloadSize < 0 || payloadSize >= static_cast<int>(PAYLOAD_MAX_SIZE)) {
@@ -434,7 +536,7 @@ bool Endpoint::queue(const char* fmt, ...) {
 
     const uint8_t queueIndex = incrementLastTxQueueIndex(); // Advance the last index to point to the newly added message
     if (isFirstInQueue(queueIndex)) {
-        send(message);
+       trySend();
     }
 
     return true;
@@ -443,7 +545,6 @@ bool Endpoint::queue(const char* fmt, ...) {
 bool Endpoint::canQueue() const {
     return _txQueue[nextTxQueueIndex()].acknowledged != 0u;
 }
-
 
 bool Endpoint::hasQueuedTxMessage() const {
     return firstTxQueueMessage().acknowledged == 0u;
@@ -515,8 +616,21 @@ void Endpoint::sendDebug(const char* fmt, ...) {
     sendFrame(FRAME_TYPE_DBG, 0u, reinterpret_cast<const uint8_t*>(_txFrameBuffer), static_cast<uint8_t>(messageSize));
 }
 
-void Endpoint::enableDebug(bool enabled) {
-    _debugEnabled = enabled;
+void Endpoint::enableDiagnostics(bool enabled) {
+    _diagnosticsEnabled = enabled;
+}
+
+void Endpoint::sendDiagnostics() {
+    _lastDiagnosticsTime = millis();
+    sendDebug("RxS=%u|Tx^=%u|Tx$=%u|#Tx=%u|TxS=%u|Q?=%s|W?=%s",
+        _lastRxSequenceNumber,
+        _firstTxQueueIndex,
+        _lastTxQueueIndex,
+        numberOfQueuedMessages(),
+        firstTxSequenceNumber(),
+        hasQueuedTxMessage() ? "Y" : "N",
+        canWrite(firstTxQueueMessage()) ? "Y" : "N"
+    );
 }
 
 bool queueCanMessage(Endpoint& serial, const char* direction, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]) {
