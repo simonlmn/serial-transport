@@ -2,6 +2,7 @@
 #define SERIAL_TRANSPORT_ENDPOINT_H_
 
 #include <Arduino.h>
+#include <toolbox/String.h>
 
 #if !defined(ARDUINO_AVR_NANO)
 #include <functional>
@@ -29,7 +30,7 @@ enum struct ConnectionState : uint8_t {
     CONNECTED  = 3,  // SYN + SYNACK + ACK complete, normal DATA/ACK operation
 };
 
-const char* describe(ConnectionState state);
+toolbox::strref describe(ConnectionState state);
 
 #if defined(ARDUINO_AVR_NANO)
 using ReceiveCallback = void (*)(const uint8_t* payload, uint8_t payloadLen, Endpoint& serial);
@@ -197,16 +198,17 @@ public:
 
     void setup(unsigned long baud = DEFAULT_BAUD_RATE, SerialConfig serialMode = DEFAULT_SERIAL_MODE);
     void reset();
-    ConnectionState connectionState() const { return _connectionState; }
     void loop();
     bool canQueue() const;
-    bool queue(const char* fmt, ...);
+    bool queue(const toolbox::strref& data);
     bool queue(const uint8_t* data, uint8_t length);
     
     bool hasQueuedTxMessage() const;
     uint8_t numberOfQueuedMessages() const;
     
-    void sendDebug(const char* fmt, ...);
+    ConnectionState connectionState() const { return _connectionState; }
+
+    void sendDebug(const toolbox::strref& message);
     void diagnostics(uint8_t diagnostics) { _diagnostics = diagnostics; }
     uint8_t diagnostics() const { return _diagnostics; }
     constexpr bool diagnosticEnabled(uint8_t flag) const { return (_diagnostics & flag) != 0u; }

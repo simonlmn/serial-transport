@@ -7,6 +7,8 @@
 #include <algorithm>
 #endif
 
+#include <toolbox/Formatter.h>
+
 namespace serial_transport {
 
 // CRC-8-CCITT lookup table (polynomial 0x07, initial value 0x00)
@@ -45,13 +47,13 @@ static const uint8_t CRC8_TABLE[256] PROGMEM = {
     0x14, 0x13, 0x1A, 0x1D, 0x08, 0x0F, 0x06, 0x01
 };
 
-const char* describe(ConnectionState state)  {
+toolbox::strref describe(ConnectionState state)  {
     switch (state) {
-        case ConnectionState::CLOSED:     return "Endpoint is closed.";
-        case ConnectionState::LISTENING:  return "Listening for incoming connection.";
-        case ConnectionState::WAITING:    return "Waiting for connection to establish.";
-        case ConnectionState::CONNECTED:  return "Connected to remote endpoint.";
-        default:                          return "UNKNOWN";
+        case ConnectionState::CLOSED:     return F("Endpoint is closed.");
+        case ConnectionState::LISTENING:  return F("Listening for incoming connection.");
+        case ConnectionState::WAITING:    return F("Waiting for connection to establish.");
+        case ConnectionState::CONNECTED:  return F("Connected to remote endpoint.");
+        default:                          return F("UNKNOWN");
     }
 }
 
@@ -116,7 +118,7 @@ void Endpoint::setConnectionState(ConnectionState state) {
         }
 
         if (diagnosticEnabled(DIAG_CONNECTION_STATE)) {
-            sendDebug("CS=%u", static_cast<uint8_t>(state));
+            sendDebug(toolbox::format(F("CS=%u"), static_cast<uint8_t>(state)));
         }
     }
 }
@@ -268,7 +270,7 @@ void Endpoint::handleFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* 
         || (type == FRAME_TYPE_SYNACK && diagnosticEnabled(DIAG_RX_SYNACK_FRAMES))
         || (type == FRAME_TYPE_RST && diagnosticEnabled(DIAG_RX_RST_FRAMES))
     ) {
-        sendDebug("RX:T=%02X|S=%u|L=%u", type, sequenceNumber, payloadLen);
+        sendDebug(toolbox::format(F("RX:T=%02X|S=%u|L=%u"), type, sequenceNumber, payloadLen));
     }
     if (_frame) {
         _frame('R', type, sequenceNumber, payload, payloadLen);
@@ -316,7 +318,7 @@ void Endpoint::handleData(uint8_t sequenceNumber, const uint8_t* payload, uint8_
             // Remote sending DATA when not connected, send RST
             sendReset();
             if (diagnosticEnabled(DIAG_RESETS)) {
-                sendDebug("RST:RXDATA");
+                sendDebug(F("RST:RXDATA"));
             }
             break;
         case ConnectionState::WAITING:
@@ -375,7 +377,7 @@ void Endpoint::handleSynAcknowledge(uint8_t sequenceNumber, uint8_t acknowledged
             reset();
             sendReset();
             if (diagnosticEnabled(DIAG_RESETS)) {
-                sendDebug("RST:SYNACK");
+                sendDebug(F("RST:SYNACK"));
             }
             break;
         case ConnectionState::WAITING:
@@ -403,7 +405,7 @@ void Endpoint::handleAcknowledge(uint8_t sequenceNumber) {
             // Remote sending ACK when not connected, send RST
             sendReset();
             if (diagnosticEnabled(DIAG_RESETS)) {
-                sendDebug("RST:ACK");
+                sendDebug(F("RST:ACK"));
             }
             break;
         case ConnectionState::WAITING:
@@ -460,7 +462,7 @@ void Endpoint::trySend() {
         reset();
         sendReset();
         if (diagnosticEnabled(DIAG_RESETS)) {
-            sendDebug("RST:TXRL");
+            sendDebug(F("RST:TXRL"));
         }
     }
 }
@@ -531,29 +533,23 @@ void Endpoint::sendFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* pa
     _serial.write(_txFrameBuffer, FRAME_OVERHEAD + payloadLen);
 }
 
-bool Endpoint::queue(const char* fmt, ...) {
+bool Endpoint::queue(const toolbox::strref& data) {
     if (!canQueue()) {
+        return false;
+    }
+
+    if (data.length() > static_cast<size_t>(PAYLOAD_MAX_SIZE)) {
         return false;
     }
 
     // Since we checked canQueue(), this will always be safe to already use the next message slot for payload formatting
     QueuedMessage& message = _txQueue[nextTxQueueIndex()];
-
-    va_list args;
-    va_start(args, fmt);
-    int payloadSize = vsnprintf(reinterpret_cast<char*>(message.payload), PAYLOAD_MAX_SIZE, fmt, args);
-    va_end(args);
-
-    if (payloadSize < 0 || payloadSize >= static_cast<int>(PAYLOAD_MAX_SIZE)) {
-        // We simply leave the message.payload in whatever state it is now, it will be overwritten on the next queue() call
-        return false;
-    }
-
     message.sequenceNumber = wrapSequenceNumber(lastTxSequenceNumber() + 1u);
     message.acknowledged = 0u;
     message.sendTime = 0u;
     message.retries = _resendLimit;
-    message.payloadSize = static_cast<uint8_t>(payloadSize);
+    message.payloadSize = static_cast<uint8_t>(data.length());
+    data.copy(reinterpret_cast<char*>(message.payload), PAYLOAD_MAX_SIZE, false);
 
     const uint8_t queueIndex = incrementLastTxQueueIndex(); // Advance the last index to point to the newly added message
     if (isFirstInQueue(queueIndex)) {
@@ -624,34 +620,31 @@ uint8_t Endpoint::nextTxSequenceNumberToSend() const {
     }
 }
 
-void Endpoint::sendDebug(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    int messageSize = vsnprintf(reinterpret_cast<char*>(_txFrameBuffer), PAYLOAD_MAX_SIZE, fmt, args);
-    va_end(args);
-
-    if (messageSize < 0 || messageSize >= static_cast<int>(PAYLOAD_MAX_SIZE)) {
+void Endpoint::sendDebug(const toolbox::strref& message) {
+    if (message.length() > static_cast<size_t>(PAYLOAD_MAX_SIZE)) {
         return;
     }
 
-    sendFrame(FRAME_TYPE_DBG, 0u, reinterpret_cast<const uint8_t*>(_txFrameBuffer), static_cast<uint8_t>(messageSize));
+    message.copy(reinterpret_cast<char*>(_txFrameBuffer), PAYLOAD_MAX_SIZE, false);
+    
+    sendFrame(FRAME_TYPE_DBG, 0u, reinterpret_cast<const uint8_t*>(_txFrameBuffer), static_cast<uint8_t>(message.length()));
 }
 
 void Endpoint::sendDiagnostics() {
     _lastDiagnosticsTime = millis();
-    sendDebug("RxS=%u|Tx^=%u|Tx$=%u|#Tx=%u|TxS=%u|Q?=%s|W?=%s",
+    sendDebug(toolbox::format(F("RxS=%u|Tx^=%u|Tx$=%u|#Tx=%u|TxS=%u|Q?=%c|W?=%c"),
         _lastRxSequenceNumber,
         _firstTxQueueIndex,
         _lastTxQueueIndex,
         numberOfQueuedMessages(),
         firstTxSequenceNumber(),
-        hasQueuedTxMessage() ? "Y" : "N",
-        canWrite(firstTxQueueMessage()) ? "Y" : "N"
-    );
+        hasQueuedTxMessage() ? 'Y' : 'N',
+        canWrite(firstTxQueueMessage()) ? 'Y' : 'N'
+    ));
 }
 
-bool queueCanMessage(Endpoint& serial, const char* direction, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]) {
-    return serial.queue("CAN%s %08lX %u %02X %02X %02X %02X %02X %02X %02X %02X",
+bool queueCanMessage(Endpoint& serial, char direction, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]) {
+    return serial.queue(toolbox::format(F("CAN%cX %08lX %u %02X %02X %02X %02X %02X %02X %02X %02X"),
         direction,
         id | (uint32_t(ext) << 31) | (uint32_t(rtr) << 30),
         length,
@@ -663,15 +656,15 @@ bool queueCanMessage(Endpoint& serial, const char* direction, uint32_t id, bool 
         data[5],
         data[6],
         data[7]
-      );
+      ));
 }
 
 bool queueCanTxMessage(Endpoint& serial, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]) {
-    return queueCanMessage(serial, "TX", id, ext, rtr, length, data);
+    return queueCanMessage(serial, 'T', id, ext, rtr, length, data);
 }
 
 bool queueCanRxMessage(Endpoint& serial, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]) {
-    return queueCanMessage(serial, "RX", id, ext, rtr, length, data);
+    return queueCanMessage(serial, 'R', id, ext, rtr, length, data);
 }
 
 }

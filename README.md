@@ -1,8 +1,6 @@
-# serial-transport: ASCII based protocol to communicate reliably over a serial connection without hardware flow control.
+# serial-transport: Protocol to communicate reliably over a serial connection without hardware flow control.
 
 This is a bit crude implementation of a transport protocol to allow two controllers to talk to each other via a serial (UART) interface without having to rely on timing or hardware flow control.
-
-The protocol is purely ASCII based to allow testing and interacting with it using the serial monitor.
 
 ## Support
 
