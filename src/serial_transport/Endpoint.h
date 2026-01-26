@@ -78,6 +78,26 @@ using FrameCallback = std::function<void(char direction, uint8_t type, uint8_t s
  * - ResendLimitReached warning triggers resynchronization attempt
  */
 class Endpoint final {
+public:
+    static constexpr uint8_t FRAME_TYPE_DATA = 0x01u;
+    static constexpr uint8_t FRAME_TYPE_ACK = 0x02u;
+    static constexpr uint8_t FRAME_TYPE_SYN = 0x03u;
+    static constexpr uint8_t FRAME_TYPE_SYNACK = 0x04u;
+    static constexpr uint8_t FRAME_TYPE_RST = 0x05u;
+    static constexpr uint8_t FRAME_TYPE_DBG = 0xFFu;
+
+    static constexpr uint8_t DIAG_NONE = 0x00u;
+    static constexpr uint8_t DIAG_PERIODIC_STATS = 0x01u;
+    static constexpr uint8_t DIAG_RESETS = 0x02u;
+    static constexpr uint8_t DIAG_CONNECTION_STATE = 0x04u;
+    static constexpr uint8_t DIAG_RX_DATA_FRAMES = 0x08u;
+    static constexpr uint8_t DIAG_RX_ACK_FRAMES = 0x10u;
+    static constexpr uint8_t DIAG_RX_SYN_FRAMES = 0x20u;
+    static constexpr uint8_t DIAG_RX_SYNACK_FRAMES = 0x40u;
+    static constexpr uint8_t DIAG_RX_RST_FRAMES = 0x80u;
+    static constexpr uint8_t DIAG_RX_HANDSHAKE_FRAMES = DIAG_RX_SYN_FRAMES | DIAG_RX_SYNACK_FRAMES;
+    static constexpr uint8_t DIAG_RX_ALL_FRAMES = DIAG_RX_DATA_FRAMES | DIAG_RX_ACK_FRAMES | DIAG_RX_HANDSHAKE_FRAMES | DIAG_RX_RST_FRAMES;
+    static constexpr uint8_t DIAG_ALL = 0xFFu;
 private:
     static const unsigned long DEFAULT_BAUD_RATE = 115200ul;
     static const SerialConfig DEFAULT_SERIAL_MODE = SERIAL_8N1;
@@ -86,13 +106,6 @@ private:
 
     static constexpr uint8_t SYNC1 = 0x5Au;
     static constexpr uint8_t SYNC2 = 0xA5u;
-    
-    static constexpr uint8_t FRAME_TYPE_DATA = 0x01u;
-    static constexpr uint8_t FRAME_TYPE_ACK = 0x02u;
-    static constexpr uint8_t FRAME_TYPE_SYN = 0x03u;
-    static constexpr uint8_t FRAME_TYPE_SYNACK = 0x04u;
-    static constexpr uint8_t FRAME_TYPE_RST = 0x05u;
-    static constexpr uint8_t FRAME_TYPE_DBG = 0xFFu;
 
     static constexpr uint8_t BUFFER_MAX_SIZE = 64u;
     
@@ -142,7 +155,7 @@ private:
 
     SerialType& _serial;
 
-    bool _diagnosticsEnabled = false;
+    uint8_t _diagnostics = DIAG_NONE;
 
     EndpointRole _role = EndpointRole::CLIENT;
 
@@ -194,7 +207,9 @@ public:
     uint8_t numberOfQueuedMessages() const;
     
     void sendDebug(const char* fmt, ...);
-    void enableDiagnostics(bool enabled);
+    void diagnostics(uint8_t diagnostics) { _diagnostics = diagnostics; }
+    uint8_t diagnostics() const { return _diagnostics; }
+    constexpr bool diagnosticEnabled(uint8_t flag) const { return (_diagnostics & flag) != 0u; }
     
     void setReceiveCallback(ReceiveCallback callback) { _receive = callback; }
     void setStateCallback(StateCallback callback) { _notifyState = callback; }

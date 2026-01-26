@@ -115,8 +115,8 @@ void Endpoint::setConnectionState(ConnectionState state) {
             _notifyState(state, *this);    
         }
 
-        if (_diagnosticsEnabled) {
-            sendDebug("CS=%u", state);
+        if (diagnosticEnabled(DIAG_CONNECTION_STATE)) {
+            sendDebug("CS=%u", static_cast<uint8_t>(state));
         }
     }
 }
@@ -150,7 +150,7 @@ void Endpoint::loop() {
             break;
         case ConnectionState::CONNECTED:
             trySend();
-            if (_diagnosticsEnabled && (_lastDiagnosticsTime == 0u || (millis() - _lastDiagnosticsTime) >= 1000u)) {
+            if (diagnosticEnabled(DIAG_PERIODIC_STATS) && (_lastDiagnosticsTime == 0u || (millis() - _lastDiagnosticsTime) >= 1000u)) {
                 sendDiagnostics();
             }
             break;
@@ -262,7 +262,12 @@ uint8_t Endpoint::calculateCrc8(const uint8_t* data, size_t length) const {
 }
 
 void Endpoint::handleFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* payload, uint8_t payloadLen) {
-    if (_diagnosticsEnabled) {
+    if ((type == FRAME_TYPE_DATA && diagnosticEnabled(DIAG_RX_DATA_FRAMES))
+        || (type == FRAME_TYPE_ACK && diagnosticEnabled(DIAG_RX_ACK_FRAMES))
+        || (type == FRAME_TYPE_SYN && diagnosticEnabled(DIAG_RX_SYN_FRAMES))
+        || (type == FRAME_TYPE_SYNACK && diagnosticEnabled(DIAG_RX_SYNACK_FRAMES))
+        || (type == FRAME_TYPE_RST && diagnosticEnabled(DIAG_RX_RST_FRAMES))
+    ) {
         sendDebug("RX:T=%02X|S=%u|L=%u", type, sequenceNumber, payloadLen);
     }
     if (_frame) {
@@ -310,6 +315,9 @@ void Endpoint::handleData(uint8_t sequenceNumber, const uint8_t* payload, uint8_
         case ConnectionState::LISTENING:
             // Remote sending DATA when not connected, send RST
             sendReset();
+            if (diagnosticEnabled(DIAG_RESETS)) {
+                sendDebug("RST:RXDATA");
+            }
             break;
         case ConnectionState::WAITING:
             // Ignore DATA when in SYN/ACK phase
@@ -366,6 +374,9 @@ void Endpoint::handleSynAcknowledge(uint8_t sequenceNumber, uint8_t acknowledged
             // Client should not be in LISTENING state!
             reset();
             sendReset();
+            if (diagnosticEnabled(DIAG_RESETS)) {
+                sendDebug("RST:SYNACK");
+            }
             break;
         case ConnectionState::WAITING:
             // Verify that our SYN was acknowledged
@@ -391,6 +402,9 @@ void Endpoint::handleAcknowledge(uint8_t sequenceNumber) {
         case ConnectionState::LISTENING:
             // Remote sending ACK when not connected, send RST
             sendReset();
+            if (diagnosticEnabled(DIAG_RESETS)) {
+                sendDebug("RST:ACK");
+            }
             break;
         case ConnectionState::WAITING:
             if (_role == EndpointRole::SERVER) {
@@ -445,6 +459,9 @@ void Endpoint::trySend() {
     if (message.retries == 0u) {
         reset();
         sendReset();
+        if (diagnosticEnabled(DIAG_RESETS)) {
+            sendDebug("RST:TXRL");
+        }
     }
 }
 
@@ -489,6 +506,10 @@ bool Endpoint::canWrite(const serial_transport::Endpoint::QueuedMessage& message
 }
 
 void Endpoint::sendFrame(uint8_t type, uint8_t sequenceNumber, const uint8_t* payload, uint8_t payloadLen) {
+    if (payloadLen > PAYLOAD_MAX_SIZE) {
+        return;
+    }
+    
     if (_frame) {
         _frame('T', type, sequenceNumber, payload, payloadLen);
     }
@@ -614,10 +635,6 @@ void Endpoint::sendDebug(const char* fmt, ...) {
     }
 
     sendFrame(FRAME_TYPE_DBG, 0u, reinterpret_cast<const uint8_t*>(_txFrameBuffer), static_cast<uint8_t>(messageSize));
-}
-
-void Endpoint::enableDiagnostics(bool enabled) {
-    _diagnosticsEnabled = enabled;
 }
 
 void Endpoint::sendDiagnostics() {
