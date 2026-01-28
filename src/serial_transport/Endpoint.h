@@ -80,6 +80,12 @@ using FrameCallback = std::function<void(char direction, uint8_t type, uint8_t s
  */
 class Endpoint final {
 public:
+    static const unsigned long DEFAULT_BAUD_RATE = 115200ul;
+    static const SerialConfig DEFAULT_SERIAL_MODE = SERIAL_8N1;
+    static const uint8_t BITS_PER_BYTE = 10u; // 1 start + 8 data + (parity) + 1 stop
+    static const uint8_t DEFAULT_RESEND_LIMIT = 50u;
+    static const unsigned long SYN_RETRY_INTERVAL = 250ul;
+
     static constexpr uint8_t FRAME_TYPE_DATA = 0x01u;
     static constexpr uint8_t FRAME_TYPE_ACK = 0x02u;
     static constexpr uint8_t FRAME_TYPE_SYN = 0x03u;
@@ -99,31 +105,29 @@ public:
     static constexpr uint8_t DIAG_RX_HANDSHAKE_FRAMES = DIAG_RX_SYN_FRAMES | DIAG_RX_SYNACK_FRAMES;
     static constexpr uint8_t DIAG_RX_ALL_FRAMES = DIAG_RX_DATA_FRAMES | DIAG_RX_ACK_FRAMES | DIAG_RX_HANDSHAKE_FRAMES | DIAG_RX_RST_FRAMES;
     static constexpr uint8_t DIAG_ALL = 0xFFu;
-private:
-    static const unsigned long DEFAULT_BAUD_RATE = 115200ul;
-    static const SerialConfig DEFAULT_SERIAL_MODE = SERIAL_8N1;
-    static const uint8_t DEFAULT_RESEND_LIMIT = 250u;
-    static const unsigned long SYN_RETRY_INTERVAL = 150ul;
 
+private:
     static constexpr uint8_t SYNC1 = 0x5Au;
     static constexpr uint8_t SYNC2 = 0xA5u;
 
-    static constexpr uint8_t BUFFER_MAX_SIZE = 64u;
-    
     static constexpr uint8_t FRAME_SYNC_SIZE = 2u; // SYNC1 + SYNC2
     static constexpr uint8_t FRAME_META_SIZE = 3u; // TYPE + LENGTH + SEQ
     static constexpr uint8_t FRAME_HEADER_SIZE = FRAME_SYNC_SIZE + FRAME_META_SIZE;
     static constexpr uint8_t FRAME_CRC_SIZE = 1u; // CRC8
     static constexpr uint8_t FRAME_OVERHEAD = FRAME_HEADER_SIZE + FRAME_CRC_SIZE;
     static constexpr uint8_t FRAME_MIN_SIZE = FRAME_OVERHEAD; // Minimum valid frame size (no payload)
+
+public:
+    static constexpr uint8_t BUFFER_MAX_SIZE = 64u;
     static constexpr uint8_t PAYLOAD_MAX_SIZE = BUFFER_MAX_SIZE - FRAME_OVERHEAD;
 
 #if defined(ARDUINO_AVR_NANO)
-    static const uint8_t TX_QUEUE_SIZE = 4u;
+    static const uint8_t TX_QUEUE_SIZE = 6u;
 #else
     static const uint8_t TX_QUEUE_SIZE = 8u;
 #endif
 
+private:
     struct QueuedMessage {
         uint8_t payload[PAYLOAD_MAX_SIZE] = {};
         uint8_t payloadSize = 0u;

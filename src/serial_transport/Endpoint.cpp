@@ -58,13 +58,10 @@ toolbox::strref describe(ConnectionState state)  {
 }
 
 unsigned long calculateTimeout(unsigned long baudRate) {
-    // Calculate timeout based on baud rate for optimal responsiveness
-    // Max frame: 64 bytes × 10 bits/byte = 640 bits
-    // Round-trip time (send DATA + receive ACK) with 5 times safety margin for processing/jitter
-    unsigned long timeout = (640UL * 1000UL * 5UL) / baudRate;
+    unsigned long timeout = (Endpoint::BUFFER_MAX_SIZE * Endpoint::BITS_PER_BYTE * 1000UL * 10UL) / baudRate;
     
-    // Clamp to reasonable range: 20-500ms
-    if (timeout < 20UL) timeout = 20UL;
+    // Clamp to reasonable range: 50-500ms
+    if (timeout < 50UL) timeout = 50UL;
     if (timeout > 500UL) timeout = 500UL;
     
     return timeout;
