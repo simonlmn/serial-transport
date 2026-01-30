@@ -11,6 +11,9 @@
 
 namespace serial_transport {
 
+static constexpr uint8_t SYNC1 = 0x5Au;
+static constexpr uint8_t SYNC2 = 0xA5u;
+
 // CRC-8-CCITT lookup table (polynomial 0x07, initial value 0x00)
 static const uint8_t CRC8_TABLE[256] PROGMEM = {
     0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15,
@@ -104,6 +107,7 @@ void Endpoint::reset() {
         _serial.read();
         yield();
     }
+
     setConnectionState(ConnectionState::CLOSED);
 }
 
@@ -431,13 +435,6 @@ void Endpoint::handleReset() {
     reset();
 }
 
-void Endpoint::incrementFirstTxQueueIndex() {
-    if (_firstTxQueueIndex == _lastTxQueueIndex) {
-        return;
-    }
-    _firstTxQueueIndex = (_firstTxQueueIndex + 1u) % TX_QUEUE_SIZE;
-}
-
 void Endpoint::trySend() {
     if (_connectionState != ConnectionState::CONNECTED) {
         return;
@@ -556,6 +553,32 @@ bool Endpoint::queue(const toolbox::strref& data) {
     return true;
 }
 
+bool Endpoint::queue(const uint8_t* data, uint8_t size) {
+    if (!canQueue()) {
+        return false;
+    }
+
+    if (size > PAYLOAD_MAX_SIZE) {
+        return false;
+    }
+
+    // Since we checked canQueue(), this will always be safe to already use the next message slot for payload formatting
+    QueuedMessage& message = _txQueue[nextTxQueueIndex()];
+    message.sequenceNumber = wrapSequenceNumber(lastTxSequenceNumber() + 1u);
+    message.acknowledged = 0u;
+    message.sendTime = 0u;
+    message.retries = _resendLimit;
+    message.payloadSize = size;
+    memmove(message.payload, data, size);
+
+    const uint8_t queueIndex = incrementLastTxQueueIndex(); // Advance the last index to point to the newly added message
+    if (isFirstInQueue(queueIndex)) {
+       trySend();
+    }
+
+    return true;
+}
+
 bool Endpoint::canQueue() const {
     return _txQueue[nextTxQueueIndex()].acknowledged != 0u;
 }
@@ -594,6 +617,13 @@ uint8_t Endpoint::firstTxSequenceNumber() const {
 
 uint8_t Endpoint::nextTxQueueIndex() const {
     return static_cast<uint8_t>((_lastTxQueueIndex + 1u) % TX_QUEUE_SIZE);
+}
+
+void Endpoint::incrementFirstTxQueueIndex() {
+    if (_firstTxQueueIndex == _lastTxQueueIndex) {
+        return;
+    }
+    _firstTxQueueIndex = (_firstTxQueueIndex + 1u) % TX_QUEUE_SIZE;
 }
 
 uint8_t Endpoint::incrementLastTxQueueIndex() {
@@ -638,30 +668,6 @@ void Endpoint::sendDiagnostics() {
         hasQueuedTxMessage() ? 'Y' : 'N',
         canWrite(firstTxQueueMessage()) ? 'Y' : 'N'
     ));
-}
-
-bool queueCanMessage(Endpoint& serial, char direction, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]) {
-    return serial.queue(toolbox::format(F("CAN%cX %08lX %u %02X %02X %02X %02X %02X %02X %02X %02X"),
-        direction,
-        id | (uint32_t(ext) << 31) | (uint32_t(rtr) << 30),
-        length,
-        data[0],
-        data[1],
-        data[2],
-        data[3],
-        data[4],
-        data[5],
-        data[6],
-        data[7]
-      ));
-}
-
-bool queueCanTxMessage(Endpoint& serial, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]) {
-    return queueCanMessage(serial, 'T', id, ext, rtr, length, data);
-}
-
-bool queueCanRxMessage(Endpoint& serial, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]) {
-    return queueCanMessage(serial, 'R', id, ext, rtr, length, data);
 }
 
 }

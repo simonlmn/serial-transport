@@ -8,11 +8,11 @@
 #include <functional>
 #endif
 
-using SerialType = decltype(Serial);
-
 #if !defined(ARDUINO_ARCH_ESP8266) && !defined(ARDUINO_ARCH_ESP32)
 using SerialConfig = uint8_t;
 #endif
+
+using SerialType = decltype(Serial);
 
 namespace serial_transport {
 
@@ -57,7 +57,7 @@ using FrameCallback = std::function<void(char direction, uint8_t type, uint8_t s
  * 
  * Total frame size: 2 + 3 header + payload + 1 CRC = max 64 bytes
  * 
- * Synchronization protocol (TCP-like):
+ * Synchronization protocol:
  * - Endpoints can operate in CLIENT or SERVER role
  * - On startup/after reset, CLIENT sends SYN to SERVER
  * - SERVER responds with SYNACK
@@ -70,16 +70,27 @@ using FrameCallback = std::function<void(char direction, uint8_t type, uint8_t s
  * Connection states:
  * - CLOSED: Endpoint is closed
  * - LISTENING: Listening for incoming connection (SYN)
- * - CONNECTING: SYN / SYNACK sent, waiting for SYNACK / ACK
+ * - WAITING: SYN / SYNACK sent, waiting for SYNACK / ACK
  * - CONNECTED: SYN + SYNACK + ACK complete, normal DATA/ACK operation
  * 
  * Timeout handling:
- * - Calculated automatically based on baud rate (typically 20-100ms at 115200 baud)
- * - High retry limit (250) allows automatic recovery from transient issues
- * - ResendLimitReached warning triggers resynchronization attempt
+ * - Calculated automatically based on baud rate
+ * - Limited retries allow automatic recovery from transient issues
+ * - When no valid frames are received within timeout, connection resets to CLOSED and restarts handshake
  */
 class Endpoint final {
+private:
+    static constexpr uint8_t FRAME_SYNC_SIZE = 2u; // SYNC1 + SYNC2
+    static constexpr uint8_t FRAME_META_SIZE = 3u; // TYPE + LENGTH + SEQ
+    static constexpr uint8_t FRAME_HEADER_SIZE = FRAME_SYNC_SIZE + FRAME_META_SIZE;
+    static constexpr uint8_t FRAME_CRC_SIZE = 1u; // CRC8
+    static constexpr uint8_t FRAME_OVERHEAD = FRAME_HEADER_SIZE + FRAME_CRC_SIZE;
+    static constexpr uint8_t FRAME_MIN_SIZE = FRAME_OVERHEAD; // Minimum valid frame size (no payload)
+
 public:
+    static constexpr uint8_t BUFFER_MAX_SIZE = 64u;
+    static constexpr uint8_t PAYLOAD_MAX_SIZE = BUFFER_MAX_SIZE - FRAME_OVERHEAD;
+
     static const unsigned long DEFAULT_BAUD_RATE = 115200ul;
     static const SerialConfig DEFAULT_SERIAL_MODE = SERIAL_8N1;
     static const uint8_t BITS_PER_BYTE = 10u; // 1 start + 8 data + (parity) + 1 stop
@@ -106,21 +117,6 @@ public:
     static constexpr uint8_t DIAG_RX_ALL_FRAMES = DIAG_RX_DATA_FRAMES | DIAG_RX_ACK_FRAMES | DIAG_RX_HANDSHAKE_FRAMES | DIAG_RX_RST_FRAMES;
     static constexpr uint8_t DIAG_ALL = 0xFFu;
 
-private:
-    static constexpr uint8_t SYNC1 = 0x5Au;
-    static constexpr uint8_t SYNC2 = 0xA5u;
-
-    static constexpr uint8_t FRAME_SYNC_SIZE = 2u; // SYNC1 + SYNC2
-    static constexpr uint8_t FRAME_META_SIZE = 3u; // TYPE + LENGTH + SEQ
-    static constexpr uint8_t FRAME_HEADER_SIZE = FRAME_SYNC_SIZE + FRAME_META_SIZE;
-    static constexpr uint8_t FRAME_CRC_SIZE = 1u; // CRC8
-    static constexpr uint8_t FRAME_OVERHEAD = FRAME_HEADER_SIZE + FRAME_CRC_SIZE;
-    static constexpr uint8_t FRAME_MIN_SIZE = FRAME_OVERHEAD; // Minimum valid frame size (no payload)
-
-public:
-    static constexpr uint8_t BUFFER_MAX_SIZE = 64u;
-    static constexpr uint8_t PAYLOAD_MAX_SIZE = BUFFER_MAX_SIZE - FRAME_OVERHEAD;
-
 #if defined(ARDUINO_AVR_NANO)
     static const uint8_t TX_QUEUE_SIZE = 6u;
 #else
@@ -128,6 +124,22 @@ public:
 #endif
 
 private:
+    EndpointRole _role = EndpointRole::CLIENT;
+    SerialType& _serial;
+    ReceiveCallback _receive;
+    StateCallback _notifyState;
+    FrameCallback _frame;
+
+    ConnectionState _connectionState = ConnectionState::CLOSED;
+    unsigned long _lastSynSendTime = 0u;
+    unsigned long _lastDiagnosticsTime = 0u;
+    unsigned long _timeout = 100UL;
+    uint8_t _resendLimit = DEFAULT_RESEND_LIMIT;
+
+    uint8_t _rxBuffer[BUFFER_MAX_SIZE] = {};
+    uint8_t _rxBufferSize = 0u;
+    uint8_t _lastRxSequenceNumber = 0u;
+
     struct QueuedMessage {
         uint8_t payload[PAYLOAD_MAX_SIZE] = {};
         uint8_t payloadSize = 0u;
@@ -136,34 +148,13 @@ private:
         uint8_t acknowledged = 1u;
         unsigned long sendTime = 0u;
     };
-
-    ConnectionState _connectionState = ConnectionState::CLOSED;
-    unsigned long _lastSynSendTime = 0u;
-    unsigned long _lastDiagnosticsTime = 0u;
-    
-    unsigned long _timeout = 100UL;
-    uint8_t _resendLimit = DEFAULT_RESEND_LIMIT;
-
-    uint8_t _rxBuffer[BUFFER_MAX_SIZE] = {};
-    uint8_t _rxBufferSize = 0u;
-    uint8_t _lastRxSequenceNumber = 0u;
-
-    uint8_t _txFrameBuffer[BUFFER_MAX_SIZE] = {};
-
     QueuedMessage _txQueue[TX_QUEUE_SIZE] = {};
     uint8_t _lastTxQueueIndex = 0u;
     uint8_t _firstTxQueueIndex = 0u;
-
-    ReceiveCallback _receive;
-    StateCallback _notifyState;
-    FrameCallback _frame;
-
-    SerialType& _serial;
+    uint8_t _txFrameBuffer[BUFFER_MAX_SIZE] = {};
 
     uint8_t _diagnostics = DIAG_NONE;
-
-    EndpointRole _role = EndpointRole::CLIENT;
-
+    
     void setConnectionState(ConnectionState state);
 
     void receive();
@@ -174,8 +165,7 @@ private:
     void handleSynAcknowledge(uint8_t sequenceNumber, uint8_t acknowledgedSeqNumber);
     void handleAcknowledge(uint8_t sequenceNumber);
     void handleReset();
-    void incrementFirstTxQueueIndex();
-
+    
     void trySend();
     void sendSyn();
     void sendSynAcknowledge();
@@ -191,8 +181,8 @@ private:
     uint8_t firstTxSequenceNumber() const;
     uint8_t nextTxQueueIndex() const;
     uint8_t incrementLastTxQueueIndex();
+    void incrementFirstTxQueueIndex();
     uint8_t lastTxSequenceNumber() const;
-
     uint8_t nextTxSequenceNumberToSend() const;
 
     void sendDiagnostics();
@@ -200,33 +190,27 @@ private:
 public:
     Endpoint(EndpointRole role, SerialType& serial, ReceiveCallback receive = nullptr, StateCallback notifyState = nullptr, FrameCallback frame = nullptr);
 
+    void setReceiveCallback(ReceiveCallback callback) { _receive = callback; }
+    void setStateCallback(StateCallback callback) { _notifyState = callback; }
+    void setFrameCallback(FrameCallback callback) { _frame = callback; }
+
+    ConnectionState connectionState() const { return _connectionState; }
+    bool hasQueuedTxMessage() const;
+    uint8_t numberOfQueuedMessages() const;
+    
     void setup(unsigned long baud = DEFAULT_BAUD_RATE, SerialConfig serialMode = DEFAULT_SERIAL_MODE);
     void reset();
     void loop();
     bool canQueue() const;
     bool queue(const toolbox::strref& data);
     bool queue(const uint8_t* data, uint8_t length);
-    
-    bool hasQueuedTxMessage() const;
-    uint8_t numberOfQueuedMessages() const;
-    
-    ConnectionState connectionState() const { return _connectionState; }
 
     void sendDebug(const toolbox::strref& message);
+    
     void diagnostics(uint8_t diagnostics) { _diagnostics = diagnostics; }
     uint8_t diagnostics() const { return _diagnostics; }
     constexpr bool diagnosticEnabled(uint8_t flag) const { return (_diagnostics & flag) != 0u; }
-    
-    void setReceiveCallback(ReceiveCallback callback) { _receive = callback; }
-    void setStateCallback(StateCallback callback) { _notifyState = callback; }
-    void setFrameCallback(FrameCallback callback) { _frame = callback; }
 };
-
-// Helper functions to send CAN messages from both sides
-
-bool queueCanTxMessage(Endpoint& serial, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]);
-
-bool queueCanRxMessage(Endpoint& serial, uint32_t id, bool ext, bool rtr, uint8_t length, const uint8_t (&data)[8]);
 
 }
 
