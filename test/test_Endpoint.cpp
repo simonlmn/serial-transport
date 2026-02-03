@@ -1,8 +1,8 @@
-#include "Arduino.h"
+#include <serial_transport/Endpoint.h>
+#include <cstdio>
+#include <cassert>
 
-#include "../src/serial_transport/Endpoint.h"
-
-void testEndpoint() {
+void test_Endpoint() {
     RingBuffer serial1to2Buffer;
     RingBuffer serial2to1Buffer;
 
@@ -82,8 +82,8 @@ void testEndpoint() {
     assert(!endpoint1.hasQueuedTxMessage());
 
     for (int i = 0; i < 255; ++i) {
-        endpoint1.queue("TEST E1 %d", i);
-        endpoint2.queue("TEST E2 %d", i);
+        endpoint1.queue("TEST E1");
+        endpoint2.queue("TEST E2");
         loop();
         loop();
     }
